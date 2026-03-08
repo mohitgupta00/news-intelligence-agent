@@ -1,10 +1,38 @@
 import requests
 import time
+import logging
 from typing import Optional
 from datetime import datetime
+from functools import wraps
 from config import (
     NEWSAPI_KEY, GNEWS_KEY, NEWSDATA_KEY, CACHE_TTL_SECONDS
 )
+
+# Setup logging for production observability
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ============================================
+# RETRY DECORATOR - Production resilience
+# ============================================
+def retry_on_error(max_retries: int = 3, delay: float = 1.0):
+    """Retry decorator for API calls with exponential backoff."""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    last_exception = e
+                    wait_time = delay * (2 ** attempt)  # Exponential backoff
+                    logger.warning(f"{func.__name__} attempt {attempt + 1} failed: {e}. Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+            logger.error(f"{func.__name__} failed after {max_retries} attempts: {last_exception}")
+            return None
+        return wrapper
+    return decorator
 
 _session_cache: dict = {}
 _cache_timestamps: dict = {}
@@ -54,6 +82,7 @@ def clear_cache() -> None:
     _session_cache.clear()
     _cache_timestamps.clear()
 
+@retry_on_error(max_retries=3, delay=1.0)
 def call_newsapi(query: str, n: int = 5) -> Optional[str]:
     try:
         from datetime import datetime, timedelta
@@ -97,6 +126,7 @@ def call_newsapi(query: str, n: int = 5) -> Optional[str]:
         print(f"NewsAPI error: {e}")
         return None
 
+@retry_on_error(max_retries=3, delay=1.0)
 def call_newsdata(query: str, n: int = 5) -> Optional[str]:
     try:
         from datetime import datetime, timedelta
@@ -138,6 +168,7 @@ def call_newsdata(query: str, n: int = 5) -> Optional[str]:
         print(f"NewsData.io error: {e}")
         return None
 
+@retry_on_error(max_retries=3, delay=1.0)
 def call_gnews(query: str, n: int = 5) -> Optional[str]:
     try:
         from datetime import datetime

@@ -1,5 +1,7 @@
 import json
 import re
+import hashlib
+import time
 from typing import Any, Optional
 from groq import Groq
 from config import GROQ_API_KEY, GROQ_MODEL
@@ -9,6 +11,36 @@ from tools.analyze_text import summarize_articles, analyze_sentiment, extract_en
 from tools.compare_entities import compare_entities
 
 _groq_client = Groq(api_key=GROQ_API_KEY)
+
+# ============================================
+# SMART LLM CACHING - Avoid redundant API calls
+# ============================================
+_llm_cache: dict = {}
+_llm_cache_ttl: int = 600  # 10 minutes TTL
+
+def _get_llm_cache_key(prompt: str, model: str = GROQ_MODEL) -> str:
+    """Generate cache key for LLM prompt."""
+    content = f"{model}:{prompt}"
+    return hashlib.md5(content.encode()).hexdigest()
+
+def _get_from_llm_cache(prompt: str) -> Optional[str]:
+    """Get cached LLM response if available and fresh."""
+    key = _get_llm_cache_key(prompt)
+    if key in _llm_cache:
+        cached_time, cached_result = _llm_cache[key]
+        if time.time() - cached_time < _llm_cache_ttl:
+            return cached_result
+    return None
+
+def _set_llm_cache(prompt: str, result: str) -> None:
+    """Cache LLM response."""
+    key = _get_llm_cache_key(prompt)
+    _llm_cache[key] = (time.time(), result)
+
+def clear_llm_cache() -> None:
+    """Clear LLM cache."""
+    global _llm_cache
+    _llm_cache = {}
 
 TEMPORAL_PATTERNS = [
     r'this\s+(week|month|year|day)',
@@ -63,32 +95,44 @@ Current query: "{query}"
 This query contains a pronoun or reference (like "it", "that", "which one", "their").
 Rewrite to be fully self-contained by explicitly naming the entity being referenced.
 Return only the rewritten query string."""
-        response = _groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1
-        )
-        resolved = response.choices[0].message.content
-        if resolved:
-            resolved = resolved.strip()
+        # Try cache first
+        cached = _get_from_llm_cache(prompt)
+        if cached:
+            resolved = cached
         else:
-            resolved = query
+            response = _groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1
+            )
+            resolved = response.choices[0].message.content
+            if resolved:
+                resolved = resolved.strip()
+                _set_llm_cache(prompt, resolved)
+            else:
+                resolved = query
     elif len(last_entities) > 1 and needs_resolution:
         context = f"Previous entities discussed: {', '.join(last_entities)}"
         prompt = f"""{context}
 Current query: "{query}"
 This query references one of the previous entities. Rewrite to explicitly name which entity.
 Return only the rewritten query string."""
-        response = _groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1
-        )
-        resolved = response.choices[0].message.content
-        if resolved:
-            resolved = resolved.strip()
+        # Try cache first
+        cached = _get_from_llm_cache(prompt)
+        if cached:
+            resolved = cached
         else:
-            resolved = query
+            response = _groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1
+            )
+            resolved = response.choices[0].message.content
+            if resolved:
+                resolved = resolved.strip()
+                _set_llm_cache(prompt, resolved)
+            else:
+                resolved = query
     else:
         resolved = query
     
@@ -127,14 +171,18 @@ Examples:
 User query: "{resolved}"
 Return only valid JSON, nothing else.
 """
-
-    response = _groq_client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.1
-    )
-
-    raw = response.choices[0].message.content.strip()
+    # Try cache first
+    cached = _get_from_llm_cache(prompt)
+    if cached:
+        raw = cached
+    else:
+        response = _groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1
+        )
+        raw = response.choices[0].message.content.strip()
+        _set_llm_cache(prompt, raw)
     
     if raw.startswith("```"):
         raw = raw.split("```")[1]
