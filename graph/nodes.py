@@ -388,45 +388,96 @@ def compare_entities_node(state: dict) -> dict:
     return {"step_outputs": existing}
 
 def replanner(state: NewsIQState) -> dict:
+    import logging
+    logger = logging.getLogger(__name__)
+    
     all_done = all(s["step"] in state["step_outputs"] for s in state["plan"])
     any_empty = any(v.get("status") == "empty" for v in state["step_outputs"].values())
     replan_count = state.get("replan_count", 0)
     
-    if replan_count >= 2:
+    max_retries = 2  # Or use configurable REPLANNER_MAX_RETRIES
+    
+    if replan_count >= max_retries:
+        logger.info(f"Replanner: max retries ({max_retries}) reached")
         return {"replan_decision": "finish"}
     
-    if any_empty and replan_count < 2:
-        prompt = f"""Original plan: {state['plan']}
-Step outputs so far: {state['step_outputs']}
-Some steps returned empty results. Add 1-2 recovery steps with broader queries.
-Return only the new steps to append as JSON array with 'step', 'tool', 'params', 'depends_on' fields."""
-
-        response = _groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1
-        )
+    if any_empty and replan_count < max_retries:
+        original_query = state.get("resolved_query", state.get("user_query", ""))
+        failed_queries = [s["params"].get("query", "") for s in state["plan"]]
         
+        prompt = f"""You are a query recovery specialist for a news intelligence system.
+
+ORIGINAL USER QUERY: "{original_query}"
+
+FAILED QUERIES (returned empty results):
+{json.dumps(failed_queries, indent=2)}
+
+You must provide recovery steps. For each failed query:
+
+1. SPELLING CORRECTION: If it looks like a misspelling (e.g., 'Tesca'→'Tesla'), correct it
+2. TOPIC BROADENING: If too narrow (e.g., 'M4 Ultra chip'→'Apple Mac'), broaden it
+3. SYNONYMS: Try alternative terms
+4. REMOVE NOISE: Remove extra words
+
+IMPORTANT: Return 2-3 DIFFERENT recovery strategies, each substantially different.
+
+Return ONLY a JSON array:
+[{{"step": 1, "tool": "fetch_news", "params": {{"query": "recovery term"}}, "depends_on": []}}]"""
+
         try:
+            response = _groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1
+            )
+            
             content = response.choices[0].message.content
             json_match = re.search(r'\[[\s\S]*\]', content)
+            
             if json_match:
                 new_steps = json.loads(json_match.group())
+                
+                # DUPLICATE PREVENTION
+                attempted_queries = set(
+                    s["params"].get("query", "").lower().strip() 
+                    for s in state["plan"]
+                )
+                filtered_steps = []
+                for s in new_steps:
+                    query = s.get("params", {}).get("query", "").lower().strip()
+                    if query and query not in attempted_queries:
+                        filtered_steps.append(s)
+                        attempted_queries.add(query)
+                    else:
+                        logger.info(f"Skipping duplicate query: {query}")
+                
+                new_steps = filtered_steps
+                
+                if not new_steps:
+                    logger.warning("No valid recovery steps after deduplication")
+                    return {"replan_decision": "finish"}
+                
                 offset = len(state["plan"])
                 for s in new_steps:
                     s["step"] = s.get("step", offset) + offset
+                
+                logger.info(f"Replanner: added {len(new_steps)} recovery steps")
                 return {
                     "plan": state["plan"] + new_steps,
                     "replan_count": replan_count + 1,
                     "replan_decision": "continue"
                 }
-        except:
-            pass
+                
+        except json.JSONDecodeError as e:
+            logger.warning(f"Replanner JSON parse error: {e}")
+        except Exception as e:
+            logger.error(f"Replanner LLM call failed: {e}")
     
     if all_done:
         return {"replan_decision": "finish"}
     
     return {"replan_decision": "continue"}
+
 
 def _build_response(final: str, state: NewsIQState) -> dict:
     """Shared response builder — updates entity memory and messages."""
