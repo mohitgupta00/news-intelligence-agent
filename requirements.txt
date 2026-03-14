@@ -1,9 +1,23 @@
+# Core
 groq
 google-genai
 requests
+aiohttp
+nest_asyncio
+
+# LangChain / LangGraph
 langgraph
+langgraph-checkpoint-sqlite
 langchain-core
 langchain-google-genai
 langchain-groq
+
+# NER
+spacy
+
+# Embeddings (cosine similarity for PRIOR check)
+sentence-transformers
+
+# Infra
 python-dotenv
 streamlit

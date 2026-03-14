@@ -1,263 +1,87 @@
-import requests
-import time
-import logging
+import asyncio, aiohttp, time, logging
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import wraps
-from config import (
-    NEWSAPI_KEY, GNEWS_KEY, NEWSDATA_KEY, CACHE_TTL_SECONDS
-)
-
-# Setup logging for production observability
-logging.basicConfig(level=logging.INFO)
+from config import NEWSAPI_KEY, GNEWS_KEY, NEWSDATA_KEY, CACHE_TTL_SECONDS
 logger = logging.getLogger(__name__)
 
-# ============================================
-# RETRY DECORATOR - Production resilience
-# ============================================
-def retry_on_error(max_retries: int = 3, delay: float = 1.0):
-    """Retry decorator for API calls with exponential backoff."""
+def retry_on_error(max_retries=3, delay=1.0):
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
-            last_exception = None
             for attempt in range(max_retries):
-                try:
-                    return func(*args, **kwargs)
+                try: return func(*args, **kwargs)
                 except Exception as e:
-                    last_exception = e
-                    wait_time = delay * (2 ** attempt)  # Exponential backoff
-                    logger.warning(f"{func.__name__} attempt {attempt + 1} failed: {e}. Retrying in {wait_time}s...")
-                    time.sleep(wait_time)
-            logger.error(f"{func.__name__} failed after {max_retries} attempts: {last_exception}")
+                    time.sleep(delay*(2**attempt))
             return None
         return wrapper
     return decorator
 
-_session_cache: dict = {}
-_cache_timestamps: dict = {}
+def _is_likely_hallucinated(text):
+    if not text: return True
+    cy = datetime.now().year
+    flags = [str(cy+i) for i in range(1,4)]+["unknown date","pre-202","note:","this timeline","the timeline only includes","may not be an exhaustive"]
+    return sum(1 for i in flags if i in text.lower()) >= 2
 
-def _is_cache_valid(key: str) -> bool:
-    if key not in _cache_timestamps:
-        return False
-    return time.time() - _cache_timestamps[key] < CACHE_TTL_SECONDS
-
-def _get_cache(key: str) -> Optional[str]:
-    if key in _session_cache and _is_cache_valid(key):
-        return _session_cache[key]
-    return None
-
-def _is_likely_hallucinated(text: str) -> bool:
-    """Check for patterns that indicate likely hallucinated or stale content."""
-    if not text:
-        return True
-    
-    current_year = datetime.now().year
-    
-    hallucination_indicators = [
-        str(current_year + 1),
-        str(current_year + 2),
-        str(current_year + 3),
-        "unknown date",
-        "pre-202",
-        "note:",
-        "this timeline",
-        "the timeline only includes",
-        "may not be an exhaustive",
-    ]
-    
-    text_lower = text.lower()
-    matches = sum(1 for indicator in hallucination_indicators if indicator in text_lower)
-    
-    if matches >= 2:
-        return True
-    
-    return False
-
-def _set_cache(key: str, value: str) -> None:
-    _session_cache[key] = value
-    _cache_timestamps[key] = time.time()
-
-def clear_cache() -> None:
-    _session_cache.clear()
-    _cache_timestamps.clear()
-
-@retry_on_error(max_retries=3, delay=1.0)
-def call_newsapi(query: str, n: int = 5) -> Optional[str]:
+async def _call_newsapi_async(session, query, n):
     try:
-        from datetime import datetime, timedelta
-        date = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d")
-        resp = requests.get(
-            "https://newsapi.org/v2/everything",
-            params={
-                "q": query,
-                "pageSize": n,
-                "from": date,
-                "sortBy": "publishedAt",
-                "apiKey": NEWSAPI_KEY
-            },
-            timeout=10
-        )
-        if resp.status_code != 200:
-            return None
-        articles = resp.json().get("articles", [])
-        if not articles:
-            return None
-        valid_articles = []
-        for a in articles:
-            title = a.get("title")
-            if not title:
-                continue
-            pub_date = a.get("publishedAt", "")
-            if pub_date:
-                try:
-                    pub_dt = datetime.fromisoformat(pub_date.replace("Z", "+00:00"))
-                    age_days = (datetime.now(pub_dt.tzinfo) - pub_dt).days
-                    if age_days > 7:
-                        continue
-                except:
-                    pass
-            desc = a.get("description") or a.get("content", "")
-            valid_articles.append(f"{title}: {desc}")
-        if not valid_articles:
-            return None
-        return "\n".join(valid_articles)
+        date=(datetime.now()-timedelta(days=2)).strftime("%Y-%m-%d")
+        async with session.get("https://newsapi.org/v2/everything",params={"q":query,"pageSize":n,"from":date,"sortBy":"publishedAt","apiKey":NEWSAPI_KEY},timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status!=200: return None
+            data=await resp.json(content_type=None)
+            valid=[]
+            for a in data.get("articles",[]):
+                t=a.get("title")
+                if not t: continue
+                valid.append(f"{t}: {a.get('description') or a.get('content','')}")
+            return "\n".join(valid) if valid else None
     except Exception as e:
-        print(f"NewsAPI error: {e}")
-        return None
+        logger.warning(f"NewsAPI err: {e}"); return None
 
-@retry_on_error(max_retries=3, delay=1.0)
-def call_newsdata(query: str, n: int = 5) -> Optional[str]:
+async def _call_newsdata_async(session, query, n):
     try:
-        from datetime import datetime, timedelta
-        resp = requests.get(
-            "https://newsdata.io/api/1/latest",
-            params={
-                "q": query,
-                "apikey": NEWSDATA_KEY,
-                "language": "en",
-                "category": "top,technology,business"
-            },
-            timeout=10
-        )
-        if resp.status_code != 200:
-            return None
-        results = resp.json().get("results", [])
-        if not results:
-            return None
-        valid_results = []
-        for r in results:
-            title = r.get("title")
-            if not title:
-                continue
-            pub_date = r.get("pubDate", "")
-            if pub_date:
-                try:
-                    pub_dt = datetime.fromisoformat(pub_date.replace("Z", "+00:00"))
-                    age_days = (datetime.now(pub_dt.tzinfo) - pub_dt).days
-                    if age_days > 7:
-                        continue
-                except:
-                    pass
-            desc = r.get("description") or r.get("content", "")
-            valid_results.append(f"{title}: {desc}")
-        if not valid_results:
-            return None
-        return "\n".join(valid_results[:n])
+        async with session.get("https://newsdata.io/api/1/latest",params={"q":query,"apikey":NEWSDATA_KEY,"language":"en","category":"top,technology,business"},timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status!=200: return None
+            data=await resp.json(content_type=None)
+            valid=[]
+            for r in data.get("results",[]):
+                t=r.get("title")
+                if not t: continue
+                valid.append(f"{t}: {r.get('description') or r.get('content','')}")
+            return "\n".join(valid[:n]) if valid else None
     except Exception as e:
-        print(f"NewsData.io error: {e}")
-        return None
+        logger.warning(f"NewsData err: {e}"); return None
 
-@retry_on_error(max_retries=3, delay=1.0)
-def call_gnews(query: str, n: int = 5) -> Optional[str]:
+async def _call_gnews_async(session, query, n):
     try:
-        from datetime import datetime
-        resp = requests.get(
-            "https://gnews.io/api/v4/search",
-            params={"q": query, "max": n, "lang": "en", "token": GNEWS_KEY},
-            timeout=10
-        )
-        if resp.status_code != 200:
-            return None
-        articles = resp.json().get("articles", [])
-        if not articles:
-            return None
-        valid_articles = []
-        for a in articles:
-            title = a.get("title")
-            if not title:
-                continue
-            pub_date = a.get("publishedAt", "")
-            if pub_date:
-                try:
-                    pub_dt = datetime.fromisoformat(pub_date.replace("Z", "+00:00"))
-                    age_days = (datetime.now(pub_dt.tzinfo) - pub_dt).days
-                    if age_days > 7:
-                        continue
-                except:
-                    pass
-            desc = a.get("description") or a.get("content", "")
-            valid_articles.append(f"{title}: {desc}")
-        if not valid_articles:
-            return None
-        return "\n".join(valid_articles)
+        async with session.get("https://gnews.io/api/v4/search",params={"q":query,"max":n,"lang":"en","token":GNEWS_KEY},timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status!=200: return None
+            data=await resp.json(content_type=None)
+            valid=[]
+            for a in data.get("articles",[]):
+                t=a.get("title")
+                if not t: continue
+                valid.append(f"{t}: {a.get('description') or a.get('content','')}")
+            return "\n".join(valid) if valid else None
     except Exception as e:
-        print(f"GNews error: {e}")
-        return None
+        logger.warning(f"GNews err: {e}"); return None
 
-def query_gdelt(query: str) -> Optional[str]:
-    try:
-        resp = requests.get(
-            "https://api.gdeltproject.org/api/v2/doc/doc",
-            params={
-                "query": query,
-                "mode": "TimelineVol",
-                "format": "json",
-                "TIMESPAN": "7d"
-            },
-            timeout=15
-        )
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        if not data or "timeline" not in data:
-            return None
-        timeline = data.get("timeline", [])
-        if not timeline:
-            return None
-        volume_data = timeline[0].get("data", [])
-        formatted = []
-        for item in volume_data[:20]:
-            formatted.append(f"Date: {item.get('date', 'N/A')}, Volume: {item.get('value', 0)}")
-        return "\n".join(formatted)
-    except Exception as e:
-        print(f"GDELT error: {e}")
-        return None
+async def fetch_news_async(query, n=5):
+    """Concurrent fetch from all 3 sources via aiohttp."""
+    async with aiohttp.ClientSession() as session:
+        results=await asyncio.gather(
+            _call_newsapi_async(session,query,n),
+            _call_newsdata_async(session,query,n),
+            _call_gnews_async(session,query,n),
+            return_exceptions=True)
+    for result,source in zip(results,["newsapi","newsdata","gnews"]):
+        if isinstance(result,str) and result and not _is_likely_hallucinated(result):
+            return result,source
+    return "","empty"
 
-def fetch_news(query: str, n: int = 5, use_cache: bool = True) -> tuple[str, str]:
-    cache_key = f"fetch::{query}::{n}"
-    
-    if use_cache:
-        cached = _get_cache(cache_key)
-        if cached and not _is_likely_hallucinated(cached):
-            return cached, "cache"
-    
-    # Primary: NewsAPI (best quality)
-    result = call_newsapi(query, n)
-    if result and not _is_likely_hallucinated(result):
-        _set_cache(cache_key, result)
-        return result, "newsapi"
-    
-    # Fallback: NewsData.io
-    result = call_newsdata(query, n)
-    if result and not _is_likely_hallucinated(result):
-        _set_cache(cache_key, result)
-        return result, "newsdata"
-    
-    # Fallback: GNews
-    result = call_gnews(query, n)
-    if result and not _is_likely_hallucinated(result):
-        _set_cache(cache_key, result)
-        return result, "gnews"
-    
-    return "", "empty"
+def fetch_news(query, n=5):
+    """Sync wrapper for backward-compat."""
+    try: return asyncio.run(fetch_news_async(query,n))
+    except RuntimeError:
+        import nest_asyncio; nest_asyncio.apply()
+        return asyncio.run(fetch_news_async(query,n))

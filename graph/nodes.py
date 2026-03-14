@@ -1,626 +1,295 @@
-import json
-import re
-import hashlib
-import time
-from typing import Any, Optional
+import re, json, hashlib, time, asyncio, logging
+from typing import Any, Optional, Literal
 from groq import Groq
-from config import GROQ_API_KEY, GROQ_MODEL
+from langchain_groq import ChatGroq
+from pydantic import BaseModel
+import config
+from config import GROQ_API_KEY, GROQ_MODEL, CACHE_TTL_SECONDS
 from graph.state import NewsIQState
-from tools.fetch_news import fetch_news, clear_cache
-from tools.analyze_text import summarize_articles, analyze_sentiment, extract_entities, analyze_timeline
+from tools.fetch_news import fetch_news_async, _is_likely_hallucinated
+from tools.analyze_text import summarize_articles, analyze_sentiment, extract_entities, analyze_timeline, _analyze_with_best_model
 from tools.compare_entities import compare_entities
 
-_groq_client = Groq(api_key=GROQ_API_KEY)
+logger=logging.getLogger(__name__)
+_groq_client=Groq(api_key=GROQ_API_KEY)
+_chat_groq=ChatGroq(api_key=GROQ_API_KEY, model=GROQ_MODEL, temperature=0.1)
 
-# ============================================
-# SMART LLM CACHING - Avoid redundant API calls
-# ============================================
-_llm_cache: dict = {}
-_llm_cache_ttl: int = 600  # 10 minutes TTL
-
-def _get_llm_cache_key(prompt: str, model: str = GROQ_MODEL) -> str:
-    """Generate cache key for LLM prompt."""
-    content = f"{model}:{prompt}"
-    return hashlib.md5(content.encode()).hexdigest()
-
-def _get_from_llm_cache(prompt: str) -> Optional[str]:
-    """Get cached LLM response if available and fresh."""
-    key = _get_llm_cache_key(prompt)
-    if key in _llm_cache:
-        cached_time, cached_result = _llm_cache[key]
-        if time.time() - cached_time < _llm_cache_ttl:
-            return cached_result
+# LLM cache (module-level OK - per-process)
+_llm_cache={}
+_LLM_CACHE_TTL=600
+def _llm_cache_key(p): return hashlib.md5(f"{GROQ_MODEL}:{p}".encode()).hexdigest()
+def _get_llm_cache(p):
+    k=_llm_cache_key(p)
+    if k in _llm_cache:
+        ts,val=_llm_cache[k]
+        if time.time()-ts<_LLM_CACHE_TTL: return val
     return None
+def _set_llm_cache(p,v): _llm_cache[_llm_cache_key(p)]=(time.time(),v)
 
-def _set_llm_cache(prompt: str, result: str) -> None:
-    """Cache LLM response."""
-    key = _get_llm_cache_key(prompt)
-    _llm_cache[key] = (time.time(), result)
+# spaCy NER setup
+try:
+    import spacy
+    _nlp=spacy.load("en_core_web_sm")
+    _SPACY_OK=True
+except OSError:
+    _nlp=None
+    _SPACY_OK=False
+    logger.warning("spaCy model missing. Run: python -m spacy download en_core_web_sm")
 
-def clear_llm_cache() -> None:
-    """Clear LLM cache."""
-    global _llm_cache
-    _llm_cache = {}
-
-TEMPORAL_PATTERNS = [
-    r'this\s+(week|month|year|day)',
-    r'latest\s+news',
-    r'recent',
-    r'latest',
-    r'today',
-    r'yesterday',
-    r'past\s+\d+\s+(days?|weeks?|months?|years?)',
-    r'last\s+\d+\s+(days?|weeks?|months?|years?)',
-]
-
-def extract_temporal_constraint(query: str) -> Optional[str]:
-    """Extract temporal constraint from query (e.g., 'this week', 'recent')."""
-    query_lower = query.lower()
-    for pattern in TEMPORAL_PATTERNS:
-        match = re.search(pattern, query_lower)
-        if match:
-            return match.group(0)
-    return None
-
-PRONOUN_PATTERNS = [
-    r'\b(it|this|that|them|their|these)\b',
-    r'\b(one|which)\b',
-]
-
-def contains_pronoun_reference(query: str) -> bool:
-    """Check if query contains pronouns that need resolution."""
-    query_lower = query.lower()
-    return any(re.search(p, query_lower) for p in PRONOUN_PATTERNS)
-
-def query_resolver(state: NewsIQState) -> dict:
-    em = state["entity_memory"]
-    query = state["user_query"]
-    messages = state.get("messages", [])
-    
-    temporal = extract_temporal_constraint(query)
-    
-    last_entity = em.get("last_entity", "")
-    last_entities = em.get("last_entities", [])
-    last_task = em.get("last_task", "")
-    
-    needs_resolution = contains_pronoun_reference(query)
-    
-    if last_entity and not needs_resolution:
-        resolved = query
-    elif last_entity and needs_resolution:
-        context = f"Previous entities discussed: {', '.join(last_entities) if last_entities else last_entity}"
-        prompt = f"""{context}
-Last task: {last_task}
-Current query: "{query}"
-This query contains a pronoun or reference (like "it", "that", "which one", "their").
-Rewrite to be fully self-contained by explicitly naming the entity being referenced.
-Return only the rewritten query string."""
-        # Try cache first
-        cached = _get_from_llm_cache(prompt)
-        if cached:
-            resolved = cached
-        else:
-            response = _groq_client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1
-            )
-            resolved = response.choices[0].message.content
-            if resolved:
-                resolved = resolved.strip()
-                _set_llm_cache(prompt, resolved)
-            else:
-                resolved = query
-    elif len(last_entities) > 1 and needs_resolution:
-        context = f"Previous entities discussed: {', '.join(last_entities)}"
-        prompt = f"""{context}
-Current query: "{query}"
-This query references one of the previous entities. Rewrite to explicitly name which entity.
-Return only the rewritten query string."""
-        # Try cache first
-        cached = _get_from_llm_cache(prompt)
-        if cached:
-            resolved = cached
-        else:
-            response = _groq_client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1
-            )
-            resolved = response.choices[0].message.content
-            if resolved:
-                resolved = resolved.strip()
-                _set_llm_cache(prompt, resolved)
-            else:
-                resolved = query
-    else:
-        resolved = query
-    
-    return {"resolved_query": resolved, "temporal_constraint": temporal}
-
-def query_rewriter(state: NewsIQState) -> dict:
-    resolved = state["resolved_query"]
-
-    prompt = f"""
-You are a search query optimizer for a news API system.
-
-Analyze the user query and return a JSON object with:
-1. "intent": one of ["summarize", "sentiment", "timeline", "compare", "extract_entities"]
-2. "api_queries": list of clean 2-5 word keyword queries for the news API
-
-CRITICAL RULE for comparisons:
-- If the query compares TWO entities, return EXACTLY 2 separate queries, one per entity
-- Never combine two entities into one query string
-
-Examples:
-"Compare Google and Microsoft news"
-→ {{"intent": "compare", "api_queries": ["Google news", "Microsoft news"]}}
-
-"Summarize latest news about OpenAI"
-→ {{"intent": "summarize", "api_queries": ["OpenAI news"]}}
-
-"What is going on in India?"
-→ {{"intent": "summarize", "api_queries": ["India current events", "India news today"]}}
-
-"Sentiment around Tesla this week"
-→ {{"intent": "sentiment", "api_queries": ["Tesla news this week"]}}
-
-"Timeline of SpaceX events"
-→ {{"intent": "timeline", "api_queries": ["SpaceX events"]}}
-
-User query: "{resolved}"
-Return only valid JSON, nothing else.
-"""
-    # Try cache first
-    cached = _get_from_llm_cache(prompt)
-    if cached:
-        raw = cached
-    else:
-        response = _groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1
-        )
-        raw = response.choices[0].message.content.strip()
-        _set_llm_cache(prompt, raw)
-    
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
-    
-    if raw.startswith("{") and "}" in raw:
+# Sentence-transformer embedder for PRIOR-check
+_embedder=None
+def _get_embedder():
+    global _embedder
+    if _embedder is None:
         try:
-            parsed = json.loads(raw)
-            intent = parsed.get("intent", "summarize")
-            api_queries = parsed.get("api_queries", [resolved])
-            if not api_queries:
-                api_queries = [resolved]
-        except (json.JSONDecodeError, AttributeError):
-            intent = "summarize"
-            api_queries = [resolved]
+            from sentence_transformers import SentenceTransformer
+            _embedder=SentenceTransformer("all-MiniLM-L6-v2")
+        except: pass
+    return _embedder
+
+def _cosine(a,b):
+    import numpy as np
+    a,b=np.array(a,dtype=float),np.array(b,dtype=float)
+    return float(np.dot(a,b)/(np.linalg.norm(a)*np.linalg.norm(b)+1e-8))
+
+def _prior_covers_query(query,last_result,threshold=0.82):
+    """Cosine similarity check - replaces expensive LLM call."""
+    if not last_result: return False
+    embedder=_get_embedder()
+    if embedder:
+        embs=embedder.encode([query,last_result[:400]])
+        return _cosine(embs[0],embs[1])>=threshold
+    # Keyword fallback
+    def tok(t): return set(re.findall(r'\b\w{3,}\b',t.lower()))
+    q_toks=tok(query)
+    return len(q_toks&tok(last_result[:400]))/max(len(q_toks),1)>=0.45
+
+# Pydantic schema for query_rewriter
+class QueryAnalysis(BaseModel):
+    intent: Literal["summarize","sentiment","timeline","compare","extract_entities"]
+    api_queries: list[str]
+
+# NER entity extraction
+class _NEROutput(BaseModel):
+    entities: list[str]
+
+def extract_entities_from_query(query):
+    """spaCy NER -> Groq structured fallback -> heuristic."""
+    if _SPACY_OK and _nlp:
+        doc=_nlp(query)
+        ents=[e.text for e in doc.ents if e.label_ in ("ORG","PERSON","GPE","PRODUCT","EVENT","NORP")]
+        if ents: return ents[:5]
+    try:
+        structured=_chat_groq.with_structured_output(_NEROutput)
+        result=structured.invoke(f"Extract named entities (people,orgs,places,products) from: \"{query}\". Return only entity strings.")
+        if result.entities: return result.entities[:5]
+    except: pass
+    words=query.split()
+    return [w.strip("'\",." for w in words if len(w)>3 and w[0].isupper() and w not in {"What","Where","When","Who","Why","How","The","This","That","These","Those","Will","Does"}][:5]
+
+# Temporal helpers
+TEMPORAL_PATTERNS=[r'this\s+(week|month|year|day)',r'latest\s+news',r'recent',r'latest',r'today',r'yesterday',r'past\s+\d+\s+(days?|weeks?|months?|years?)',r'last\s+\d+\s+(days?|weeks?|months?|years?)']
+PRONOUN_PATTERNS=[r'\b(it|this|that|them|their|these)\b',r'\b(one|which)\b']
+
+def extract_temporal_constraint(query):
+    for p in TEMPORAL_PATTERNS:
+        m=re.search(p,query.lower())
+        if m: return m.group(0)
+    return None
+
+def contains_pronoun_reference(query):
+    return any(re.search(p,query.lower()) for p in PRONOUN_PATTERNS)
+
+# OOS patterns
+_OOS_PATTERNS=[r'stock\s*(price|value)',r'predict.*price',r'forecast.*stock',r'will.*go\s+(up|down)',r'price.*will',r'how much.*will.*(cost|be worth)',r'investment.*advice',r'should\s+I\s+(buy|sell)']
+
+# guard_node (NEW)
+def guard_node(state):
+    """Dedicated OOS gate between query_rewriter and planner."""
+    query_lower=state["resolved_query"].lower()
+    if any(re.search(p,query_lower) for p in _OOS_PATTERNS):
+        return {"replan_decision":"out_of_scope"}
+    return {"replan_decision":None}
+
+# turn_initializer
+def turn_initializer(state):
+    """Resets per-turn state."""
+    return {"plan":[],"step_outputs":{},"session_cache":{},"current_step":0,"replan_count":0,"replan_decision":None,"final_answer":None,"planning_done":False,"temporal_constraint":None,"api_queries":[],"intent":""}
+
+# query_resolver
+def query_resolver(state):
+    em=state["entity_memory"]
+    query=state["user_query"]
+    temporal=extract_temporal_constraint(query)
+    last_entity=em.get("last_entity","")
+    last_entities=em.get("last_entities",[])
+    last_task=em.get("last_task","")
+    needs_res=contains_pronoun_reference(query)
+    if not last_entity or not needs_res: resolved=query
     else:
-        intent = "summarize"
-        api_queries = [resolved]
+        context=f"Previous entities: {', '.join(last_entities) if last_entities else last_entity}"
+        prompt=f"{context}\nLast task: {last_task}\nCurrent query: \"{query}\"\nRewrite to be fully self-contained. Return only the rewritten string."
+        cached=_get_llm_cache(prompt)
+        if cached: resolved=cached
+        else:
+            resp=_groq_client.chat.completions.create(model=GROQ_MODEL,messages=[{"role":"user","content":prompt}],temperature=0.1)
+            resolved=(resp.choices[0].message.content or query).strip()
+            _set_llm_cache(prompt,resolved)
+    return {"resolved_query":resolved,"temporal_constraint":temporal}
 
-    return {"intent": intent, "api_queries": api_queries}
+# query_rewriter (structured output)
+def query_rewriter(state):
+    resolved=state["resolved_query"]
+    structured=_chat_groq.with_structured_output(QueryAnalysis)
+    prompt=f"Analyze user query and determine:\n1. intent: summarize|sentiment|timeline|compare|extract_entities\n2. api_queries: 1-3 clean 2-5 word keyword strings\n\nCRITICAL: for compare queries with 2 entities, produce EXACTLY 2 separate queries.\n\nExamples:\n  'Compare Google and Microsoft' -> intent=compare, api_queries=['Google news','Microsoft news']\n  'Summarize latest OpenAI news' -> intent=summarize, api_queries=['OpenAI news']\n\nUser query: \"{resolved}\""
+    try:
+        result=structured.invoke(prompt)
+        return {"intent":result.intent,"api_queries":result.api_queries or [resolved]}
+    except Exception as e:
+        logger.warning(f"query_rewriter error: {e}")
+        return {"intent":"summarize","api_queries":[resolved]}
 
-def planner(state: NewsIQState) -> dict:
-    if state.get("planning_done", False) and state.get("plan"):
-        return {"planning_done": True}
-    
-    resolved_query = state["resolved_query"]
-    api_queries = state.get("api_queries", [resolved_query])
-    intent = state.get("intent", "summarize")
-    temporal = state.get("temporal_constraint", "")
-    
-    query_lower = resolved_query.lower()
-    out_of_scope_patterns = [
-        r'stock\s*(price|value)',
-        r'predict.*price',
-        r'forecast.*stock',
-        r'will.*go\s+(up|down)',
-        r'price.*will',
-        r'how much.*will.*(cost|be worth)',
-        r'investment.*advice',
-        r'should\s+I\s+(buy|sell)',
-    ]
-    
-    is_out_of_scope = any(re.search(p, query_lower) for p in out_of_scope_patterns)
-    
-    if is_out_of_scope:
-        return {
-            "plan": [],
-            "planning_done": True,
-            "replan_decision": "out_of_scope"
-        }
-    
-    temporal_suffix = f" {temporal}" if temporal else ""
-    
-    if intent == "compare" and len(api_queries) == 2:
-        plan = [
-            {"step": 0, "tool": "compare_entities",
-             "params": {"entity_a": api_queries[0], "entity_b": api_queries[1]},
-             "depends_on": []}
-        ]
-    elif intent == "timeline":
-        plan = [
-            {"step": 0, "tool": "fetch_news",
-             "params": {"query": api_queries[0] + temporal_suffix, "n": 7}, "depends_on": []},
-            {"step": 1, "tool": "analyze_text",
-             "params": {"task": "timeline"}, "depends_on": [0]}
-        ]
-    elif intent in ["summarize", "sentiment", "extract_entities"]:
-        fetch_steps = [
-            {"step": i, "tool": "fetch_news",
-             "params": {"query": q, "n": 5}, "depends_on": []}
-            for i, q in enumerate(api_queries)
-        ]
-        analyze_step = {
-            "step": len(api_queries),
-            "tool": "analyze_text",
-            "params": {"task": intent},
-            "depends_on": list(range(len(api_queries)))
-        }
-        plan = fetch_steps + [analyze_step]
+# planner
+def planner(state):
+    if state.get("planning_done") and state.get("plan"): return {"planning_done":True}
+    resolved=state["resolved_query"]
+    api_queries=state.get("api_queries",[resolved])
+    intent=state.get("intent","summarize")
+    temporal=state.get("temporal_constraint","") or ""
+    tsuffix=f" {temporal}" if temporal else ""
+    if intent=="compare" and len(api_queries)==2:
+        plan=[{"step":0,"tool":"compare_entities","params":{"entity_a":api_queries[0],"entity_b":api_queries[1]},"depends_on":[]}]
+    elif intent=="timeline":
+        plan=[{"step":0,"tool":"fetch_news","params":{"query":api_queries[0]+tsuffix,"n":7},"depends_on":[]},{"step":1,"tool":"analyze_text","params":{"task":"timeline"},"depends_on":[0]}]
+    elif intent in ("summarize","sentiment","extract_entities"):
+        plan=[{"step":i,"tool":"fetch_news","params":{"query":q,"n":5},"depends_on":[]} for i,q in enumerate(api_queries)]
+        plan.append({"step":len(api_queries),"tool":"analyze_text","params":{"task":intent},"depends_on":list(range(len(api_queries)))})
     else:
-        plan = [
-            {"step": 0, "tool": "fetch_news",
-             "params": {"query": api_queries[0] + temporal_suffix, "n": 5}, "depends_on": []},
-            {"step": 1, "tool": "analyze_text",
-             "params": {"task": "summarize"}, "depends_on": [0]}
-        ]
+        plan=[{"step":0,"tool":"fetch_news","params":{"query":api_queries[0]+tsuffix,"n":5},"depends_on":[]},{"step":1,"tool":"analyze_text","params":{"task":"summarize"},"depends_on":[0]}]
+    return {"plan":plan,"current_step":0,"replan_count":0}
 
-    return {"plan": plan, "current_step": 0, "replan_count": 0}
-
-def router(state: NewsIQState) -> list[dict]:
+# router
+def router(state):
     from langgraph.constants import Send
-    
-    ready_steps = [
-        s for s in state["plan"]
-        if s["step"] not in state["step_outputs"]
-        and all(dep in state["step_outputs"] for dep in s.get("depends_on", []))
-    ]
-    
-    sends = []
-    for step in ready_steps:
-        tool = step["tool"]
-        sends.append(Send(tool, {"step": step, "state": state}))
-    
-    return sends
+    ready=[s for s in state["plan"] if s["step"] not in state["step_outputs"] and all(dep in state["step_outputs"] for dep in s.get("depends_on",[]))]
+    return [Send(s["tool"],{"step":s,"state":state}) for s in ready]
 
-def fetch_news_node(state: dict) -> dict:
-    if "step" in state:
-        step = state["step"]
-        state = state["state"]
+# fetch_news_node (async)
+async def fetch_news_node(state):
+    if "step" in state: step,full_state=state["step"],state["state"]
     else:
-        pending = [s for s in state.get("plan", []) if s["step"] not in state.get("step_outputs", {})]
-        if not pending:
-            return {"step_outputs": {}}
-        step = pending[0]
-    
-    query = step["params"].get("query", "")
-    n = step["params"].get("n", 5)
-    
-    result, source = fetch_news(query, n=n)
-    status = "success" if result else "empty"
-    
-    existing = state.get("step_outputs", {})
-    existing[step["step"]] = {
-        "step_index": step["step"],
-        "tool": "fetch_news",
-        "params": step["params"],
-        "result": result,
-        "status": status
-    }
-    
-    return {"step_outputs": existing}
+        pending=[s for s in state.get("plan",[]) if s["step"] not in state.get("step_outputs",{})]
+        if not pending: return {"step_outputs":{}}
+        step,full_state=pending[0],state
+    query=step["params"].get("query","")
+    n=step["params"].get("n",5)
+    session_cache=dict(full_state.get("session_cache",{}))
+    cache_key=f"fetch::{query}::{n}"
+    if cache_key in session_cache:
+        cached_val,cached_ts=session_cache[cache_key]
+        if time.time()-cached_ts<CACHE_TTL_SECONDS and not _is_likely_hallucinated(cached_val):
+            result,source=cached_val,"cache"
+        else: result,source=await fetch_news_async(query,n)
+    else: result,source=await fetch_news_async(query,n)
+    if result: session_cache[cache_key]=(result,time.time())
+    existing=dict(full_state.get("step_outputs",{}))
+    existing[step["step"]]={"step_index":step["step"],"tool":"fetch_news","params":step["params"],"result":result,"status":"success" if result else "empty","source":source}
+    return {"step_outputs":existing,"session_cache":session_cache}
 
-def analyze_text_node(state: dict) -> dict:
-    if "step" in state:
-        step = state["step"]
-        state = state["state"]
+# analyze_text_node
+def analyze_text_node(state):
+    if "step" in state: step,full_state=state["step"],state["state"]
     else:
-        pending = [s for s in state.get("plan", []) if s["step"] not in state.get("step_outputs", {})]
-        if not pending:
-            return {"step_outputs": {}}
-        step = pending[0]
-    
-    task = step["params"].get("task", "summarize")
-    
-    dep_outputs = []
-    for dep in step.get("depends_on", []):
-        dep_data = state["step_outputs"].get(dep, {})
-        if dep_data.get("result"):
-            dep_outputs.append(dep_data["result"])
-    
-    articles_text = "\n\n".join(dep_outputs)
-    
-    if task == "timeline":
-        query = step["params"].get("query", state.get("resolved_query", ""))
-        result = analyze_timeline(query)
-    elif task == "summarize":
-        result = summarize_articles(articles_text)
-    elif task == "sentiment":
-        result = analyze_sentiment(articles_text)
-    elif task == "extract_entities":
-        result = extract_entities(articles_text)
+        pending=[s for s in state.get("plan",[]) if s["step"] not in state.get("step_outputs",{})]
+        if not pending: return {"step_outputs":{}}
+        step,full_state=pending[0],state
+    task=step["params"].get("task","summarize")
+    dep_outputs=[full_state["step_outputs"][dep]["result"] for dep in step.get("depends_on",[]) if full_state["step_outputs"].get(dep,{}).get("result")]
+    articles_text="\n\n".join(dep_outputs)
+    if task=="timeline": result=analyze_timeline(step["params"].get("query",full_state.get("resolved_query","")))
+    elif task=="summarize": result=summarize_articles(articles_text)
+    elif task=="sentiment": result=analyze_sentiment(articles_text)
+    elif task=="extract_entities": result=extract_entities(articles_text)
+    else: result=f"Unknown task: {task}"
+    existing=dict(full_state.get("step_outputs",{}))
+    existing[step["step"]]={"step_index":step["step"],"tool":"analyze_text","params":step["params"],"result":result,"status":"success"}
+    return {"step_outputs":existing}
+
+# compare_entities_node
+def compare_entities_node(state):
+    if "step" in state: step,full_state=state["step"],state["state"]
     else:
-        result = f"Unknown task: {task}"
-    
-    existing = state.get("step_outputs", {})
-    existing[step["step"]] = {
-        "step_index": step["step"],
-        "tool": "analyze_text",
-        "params": step["params"],
-        "result": result,
-        "status": "success"
-    }
-    
-    return {"step_outputs": existing}
+        pending=[s for s in state.get("plan",[]) if s["step"] not in state.get("step_outputs",{})]
+        if not pending: return {"step_outputs":{}}
+        step,full_state=pending[0],state
+    entity_a=step["params"].get("entity_a","")
+    entity_b=step["params"].get("entity_b","")
+    result=compare_entities(entity_a,entity_b,state=full_state)
+    existing=dict(full_state.get("step_outputs",{}))
+    existing[step["step"]]={"step_index":step["step"],"tool":"compare_entities","params":step["params"],"result":result,"status":"success"}
+    return {"step_outputs":existing}
 
-def compare_entities_node(state: dict) -> dict:
-    if "step" in state:
-        step = state["step"]
-        full_state = state["state"]
-    else:
-        pending = [s for s in state.get("plan", []) if s["step"] not in state.get("step_outputs", {})]
-        if not pending:
-            return {"step_outputs": {}}
-        step = pending[0]
-        full_state = state
-    
-    entity_a = step["params"].get("entity_a", "")
-    entity_b = step["params"].get("entity_b", "")
-    
-    result = compare_entities(entity_a, entity_b, state=full_state)
-    
-    existing = full_state.get("step_outputs", {})
-    existing[step["step"]] = {
-        "step_index": step["step"],
-        "tool": "compare_entities",
-        "params": step["params"],
-        "result": result,
-        "status": "success"
-    }
-    
-    return {"step_outputs": existing}
+# step_collector (no polling)
+def step_collector(state):
+    """LangGraph guarantees all Send results merged."""
+    return {"all_steps_complete":True}
 
-def replanner(state: NewsIQState) -> dict:
-    import logging
-    logger = logging.getLogger(__name__)
-    
-    all_done = all(s["step"] in state["step_outputs"] for s in state["plan"])
-    any_empty = any(v.get("status") == "empty" for v in state["step_outputs"].values())
-    replan_count = state.get("replan_count", 0)
-    
-    max_retries = 2  # Or use configurable REPLANNER_MAX_RETRIES
-    
-    if replan_count >= max_retries:
-        logger.info(f"Replanner: max retries ({max_retries}) reached")
-        return {"replan_decision": "finish"}
-    
-    if any_empty and replan_count < max_retries:
-        original_query = state.get("resolved_query", state.get("user_query", ""))
-        failed_queries = [s["params"].get("query", "") for s in state["plan"]]
-        
-        prompt = f"""You are a query recovery specialist for a news intelligence system.
-
-ORIGINAL USER QUERY: "{original_query}"
-
-FAILED QUERIES (returned empty results):
-{json.dumps(failed_queries, indent=2)}
-
-You must provide recovery steps. For each failed query:
-
-1. SPELLING CORRECTION: If it looks like a misspelling (e.g., 'Tesca'→'Tesla'), correct it
-2. TOPIC BROADENING: If too narrow (e.g., 'M4 Ultra chip'→'Apple Mac'), broaden it
-3. SYNONYMS: Try alternative terms
-4. REMOVE NOISE: Remove extra words
-
-IMPORTANT: Return 2-3 DIFFERENT recovery strategies, each substantially different.
-
-Return ONLY a JSON array:
-[{{"step": 1, "tool": "fetch_news", "params": {{"query": "recovery term"}}, "depends_on": []}}]"""
-
+# replanner
+def replanner(state):
+    any_empty=any(v.get("status")=="empty" for v in state["step_outputs"].values())
+    replan_count=state.get("replan_count",0)
+    max_retries=2
+    if replan_count>=max_retries: return {"replan_decision":"finish"}
+    if any_empty and replan_count<max_retries:
+        failed_queries=[s["params"].get("query","") for s in state["plan"]]
+        original=state.get("resolved_query",state.get("user_query",""))
+        prompt=f"You are a query recovery specialist.\nORIGINAL: \"{original}\"\nFAILED: {json.dumps(failed_queries)}\nProvide 2-3 recovery strategies. Return ONLY JSON array: [{{\"step\":1,\"tool\":\"fetch_news\",\"params\":{{\"query\":\"...\"}}}}]"
         try:
-            response = _groq_client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.1
-            )
-            
-            content = response.choices[0].message.content
-            json_match = re.search(r'\[[\s\S]*\]', content)
-            
-            if json_match:
-                new_steps = json.loads(json_match.group())
-                
-                # DUPLICATE PREVENTION
-                attempted_queries = set(
-                    s["params"].get("query", "").lower().strip() 
-                    for s in state["plan"]
-                )
-                filtered_steps = []
-                for s in new_steps:
-                    query = s.get("params", {}).get("query", "").lower().strip()
-                    if query and query not in attempted_queries:
-                        filtered_steps.append(s)
-                        attempted_queries.add(query)
-                    else:
-                        logger.info(f"Skipping duplicate query: {query}")
-                
-                new_steps = filtered_steps
-                
-                if not new_steps:
-                    logger.warning("No valid recovery steps after deduplication")
-                    return {"replan_decision": "finish"}
-                
-                offset = len(state["plan"])
-                for s in new_steps:
-                    s["step"] = s.get("step", offset) + offset
-                
-                logger.info(f"Replanner: added {len(new_steps)} recovery steps")
-                return {
-                    "plan": state["plan"] + new_steps,
-                    "replan_count": replan_count + 1,
-                    "replan_decision": "continue"
-                }
-                
-        except json.JSONDecodeError as e:
-            logger.warning(f"Replanner JSON parse error: {e}")
+            resp=_groq_client.chat.completions.create(model=GROQ_MODEL,messages=[{"role":"user","content":prompt}],temperature=0.1)
+            content=resp.choices[0].message.content
+            match=re.search(r'\[[\s\S]*\]',content)
+            if not match: return {"replan_decision":"finish"}
+            new_steps=json.loads(match.group())
+            attempted={s["params"].get("query","").lower() for s in state["plan"]}
+            filtered=[s for s in new_steps if s.get("params",{}).get("query","").lower() not in attempted]
+            if not filtered: return {"replan_decision":"finish"}
+            offset=len(state["plan"])
+            for i,s in enumerate(filtered): s["step"]=offset+i
+            return {"plan":state["plan"]+filtered,"replan_count":replan_count+1,"replan_decision":"continue"}
         except Exception as e:
-            logger.error(f"Replanner LLM call failed: {e}")
-    
-    if all_done:
-        return {"replan_decision": "finish"}
-    
-    return {"replan_decision": "continue"}
+            logger.error(f"Replanner error: {e}")
+    return {"replan_decision":"finish"}
 
+# synthesizer
+def _build_response(final,state):
+    entities=extract_entities_from_query(state["resolved_query"])
+    return {"final_answer":final,"entity_memory":{"last_entity":entities[0] if entities else state["entity_memory"].get("last_entity"),"last_entities":entities,"last_task":state.get("intent"),"last_result":final},"messages":[{"role":"assistant","content":final}]}
 
-def _build_response(final: str, state: NewsIQState) -> dict:
-    """Shared response builder — updates entity memory and messages."""
-    entities = extract_entities_from_query(state["resolved_query"])
-    return {
-        "final_answer": final,
-        "entity_memory": {
-            "last_entity": entities[0] if entities else state["entity_memory"].get("last_entity"),
-            "last_entities": entities,
-            "last_task": state.get("intent"),
-            "last_result": final
-        },
-        "messages": [{"role": "assistant", "content": final}]
-    }
+def synthesizer(state):
+    resolved=state.get("resolved_query",state.get("user_query",""))
+    intent=state.get("intent","summarize")
+    entity_memory=state.get("entity_memory",{})
+    step_outputs=state.get("step_outputs",{})
+    if state.get("replan_decision")=="out_of_scope":
+        return _build_response("I'm a news analysis assistant and don't handle prediction questions like stock prices or investment advice. I can help with news summaries, sentiment analysis, entity comparisons, and timelines. Try that?",state)
+    all_empty=all(v.get("status")=="empty" for v in step_outputs.values()) if step_outputs else True
+    if all_empty: return _build_response("I wasn't able to find news articles about this query. Try rephrasing.",state)
+    last_result=entity_memory.get("last_result","")
+    if last_result and _prior_covers_query(resolved,last_result):
+        prior_prompt=f"Answer this question using only the prior result below.\nQuestion: {resolved}\nPrior result: {last_result}\nGive a direct, concise answer."
+        return _build_response(_analyze_with_best_model(prior_prompt),state)
+    all_results=[f"Step {k} ({v.get('tool','?')}): {v.get('result','')}" for k,v in sorted(step_outputs.items())]
+    combined="\n\n".join(all_results)
+    prior_ctx=""
+    for pe in state.get("prior_entity_results",[]):
+        prior_ctx+=f"- {pe['entity']}: {pe['result'][:500]}\n"
+    if prior_ctx: combined+=f"\n\nPrevious context:\n{prior_ctx}"
+    prompt=f"Original query: {resolved}\n\nResearch outputs:\n{combined}\n\nWrite a clear, structured answer. Be concise but informative."
+    return _build_response(_analyze_with_best_model(prompt),state)
 
-
-def synthesizer(state: NewsIQState) -> dict:
-    resolved_query = state.get("resolved_query", state.get("user_query", ""))
-    intent = state.get("intent", "summarize")
-    entity_memory = state.get("entity_memory", {})
-    step_outputs = state.get("step_outputs", {})
-    
-    if state.get("replan_decision") == "out_of_scope":
-        final_answer = (
-            "I'm a news analysis assistant and don't handle prediction questions like stock prices, "
-            "financial forecasts, or investment advice. I can help you with news summaries, "
-            "sentiment analysis, entity comparisons, and timelines. Would you like to ask about "
-            "recent news on a topic instead?"
-        )
-        return _build_response(final_answer, state)
-    
-    all_empty = all(v.get("status") == "empty" for v in step_outputs.values()) if step_outputs else True
-    
-    if all_empty:
-        final_answer = (
-            "I wasn't able to find news articles specifically about this query. "
-            "Try rephrasing or asking about a broader topic."
-        )
-        return _build_response(final_answer, state)
-    
-    last_result = entity_memory.get("last_result", "")
-    
-    if last_result:
-        try:
-            followup_prompt = f"""Does this query require fetching NEW information, 
-or can it be answered using a prior result?
-Query: "{resolved_query}"
-Prior result available: "{last_result[:300]}"
-Answer with only: NEW or PRIOR"""
-            
-            followup_response = _groq_client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[{"role": "user", "content": followup_prompt}],
-                temperature=0.1,
-                max_tokens=10
-            )
-            
-            is_prior = followup_response.choices[0].message.content.strip().upper()
-            
-            if is_prior == "PRIOR":
-                prior_prompt = f"""Answer this question using only the prior result below.
-Question: {resolved_query}
-Prior result: {last_result}
-Give a direct, concise answer."""
-                
-                prior_response = _groq_client.chat.completions.create(
-                    model=GROQ_MODEL,
-                    messages=[{"role": "user", "content": prior_prompt}],
-                    temperature=0.3,
-                    max_tokens=1000
-                )
-                
-                final_answer = prior_response.choices[0].message.content or "Unable to generate answer."
-                return _build_response(final_answer, state)
-        except Exception:
-            pass
-    
-    all_results = []
-    for k, v in sorted(step_outputs.items()):
-        all_results.append(f"Step {k} ({v.get('tool', 'unknown')}): {v.get('result', '')}")
-    
-    combined = "\n\n".join(all_results)
-    
-    prior_results = state.get("prior_entity_results", [])
-    prior_context = ""
-    if prior_results:
-        prior_context = "\n\nPrevious entity results:\n"
-        for pe in prior_results:
-            prior_context += f"- {pe['entity']}: {pe['result'][:500]}\n"
-    
-    prompt = f"""Original query: {resolved_query}
-Research outputs:
-{combined}{prior_context}
-
-Write a clear, structured final answer for the user. Be concise but informative."""
-
-    response = _groq_client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
-        max_tokens=2000
-    )
-    
-    final_answer = response.choices[0].message.content or "Unable to generate answer."
-    
-    return _build_response(final_answer, state)
-
-def extract_entities_from_query(query: str) -> list[str]:
-    words = query.split()
-    entities = [w.strip("'\",.") for w in words if len(w) > 2 and w[0].isupper()]
-    return entities[:5]
-
-def infer_task(plan: list[dict]) -> str:
+def infer_task(plan):
     for step in plan:
-        tool = step.get("tool", "")
-        if tool == "analyze_text":
-            return step.get("params", {}).get("task", "unknown")
-        elif tool == "compare_entities":
-            return "compare"
+        tool=step.get("tool","")
+        if tool=="analyze_text": return step.get("params",{}).get("task","unknown")
+        if tool=="compare_entities": return "compare"
     return "unknown"
-
-def turn_initializer(state: NewsIQState) -> dict:
-    """Clears per-turn data. Preserves entity_memory and prior_entity_results for session continuity."""
-    clear_cache()
-    return {
-        "plan": [],
-        "step_outputs": {},
-        "current_step": 0,
-        "replan_count": 0,
-        "replan_decision": None,
-        "final_answer": None,
-        "planning_done": False,
-        "temporal_constraint": None,
-        "api_queries": [],
-        "intent": "",
-    }
-
-def step_collector(state: NewsIQState) -> dict:
-    """Fan-in gate: only proceeds when ALL planned steps are complete."""
-    total_steps = len(state["plan"])
-    completed_steps = len(state["step_outputs"])
-    
-    if completed_steps < total_steps:
-        return {}
-    
-    return {"all_steps_complete": True}
