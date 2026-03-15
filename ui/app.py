@@ -149,8 +149,9 @@ def main():
         
         st.markdown("---")
         st.markdown("### 🤖 Models")
-        st.markdown("- **Groq** - Planning")
-        st.markdown("- **Gemini** - Analysis")
+        st.markdown("- **Groq** (llama-3.1-8b-instant)")
+        st.markdown("  - Planning & Orchestration")
+        st.markdown("  - Text Analysis & Summarization")
         
         st.markdown("---")
         st.markdown("### 💡 Try asking:")

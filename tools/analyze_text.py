@@ -1,23 +1,15 @@
 from typing import Optional
 from groq import Groq
-from google import genai
-from config import GROQ_API_KEY, GEMINI_API_KEY, GROQ_MODEL, GEMINI_MODEL
+from config import GROQ_API_KEY, GROQ_MODEL
 from tools.fetch_news import fetch_news
 
 _groq_client = None
-_gemini_client = None
 
 def _get_groq_client():
     global _groq_client
     if _groq_client is None:
         _groq_client = Groq(api_key=GROQ_API_KEY)
     return _groq_client
-
-def _get_gemini_client():
-    global _gemini_client
-    if _gemini_client is None and GEMINI_API_KEY:
-        _gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-    return _gemini_client
 
 def analyze_with_groq(prompt: str) -> str:
     client = _get_groq_client()
@@ -29,28 +21,8 @@ def analyze_with_groq(prompt: str) -> str:
     )
     return response.choices[0].message.content or ""
 
-def analyze_with_gemini(prompt: str) -> str:
-    client = _get_gemini_client()
-    if client is None:
-        return None  # Signal that Gemini is not available
-    try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt
-        )
-        return response.text or ""
-    except Exception as e:
-        # Any error means we should fallback to Groq
-        print(f"Gemini error: {e}")
-        return None
-
 def _analyze_with_best_model(prompt: str) -> str:
-    """Use Gemini if available, otherwise fallback to Groq."""
-    # Try Gemini first
-    result = analyze_with_gemini(prompt)
-    if result is not None:
-        return result
-    # Fallback to Groq
+    """Use Groq for all analysis tasks."""
     return analyze_with_groq(prompt)
 
 def summarize_articles(articles_text: str) -> str:
