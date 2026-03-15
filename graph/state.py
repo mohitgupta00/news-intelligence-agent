@@ -2,8 +2,11 @@ from typing import TypedDict, Optional, Annotated
 from operator import add
 
 def merge_dicts(a: dict, b: dict) -> dict:
-    """Merge two dicts — used for fan-out step_outputs."""
-    return {**a, **b}
+    """Merge two dicts — used for fan-out step_outputs and session_cache."""
+    result = dict(a) if a else {}
+    if b:
+        result.update(b)
+    return result
 
 class StepOutput(TypedDict):
     step_index: int
@@ -38,7 +41,7 @@ class NewsIQState(TypedDict):
     
     entity_memory: EntityMemory
     prior_entity_results: list[PriorEntityResult]
-    session_cache: dict
+    session_cache: dict  # Changed: removed Annotated to avoid concurrent update issues
     
     replan_count: int
     replan_decision: Optional[str]

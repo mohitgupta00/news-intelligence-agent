@@ -76,6 +76,15 @@ def process_query(query: str) -> str:
     state['user_query'] = query
     config = get_thread_config(st.session_state.thread_id)
     result = asyncio.get_event_loop().run_until_complete(graph.ainvoke(state, config))
+    
+    # Update session_cache from step_outputs (to avoid concurrent update errors)
+    if 'step_outputs' in result:
+        session_cache = result.get('session_cache', {})
+        for step_output in result['step_outputs'].values():
+            if step_output.get('cache_key') and step_output.get('cache_value'):
+                session_cache[step_output['cache_key']] = step_output['cache_value']
+        result['session_cache'] = session_cache
+    
     st.session_state.state = result
     
     # Update last activity timestamp

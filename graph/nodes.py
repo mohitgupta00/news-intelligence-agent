@@ -114,9 +114,12 @@ def guard_node(state):
 # turn_initializer
 def turn_initializer(state):
     """Resets per-turn state, preserving session memory across turns."""
+    # For fields with reducers, we can't directly reset them
+    # step_outputs will be overwritten by new values from tools
+    # session_cache will be merged (which is what we want)
+    # messages will be appended (which is what we want)
     return {
         "plan": [],
-        "step_outputs": {},
         "current_step": 0,
         "replan_count": 0,
         "replan_decision": None,
@@ -124,16 +127,11 @@ def turn_initializer(state):
         "planning_done": False,
         "temporal_constraint": None,
         "api_queries": [],
-        "intent": "",
-        # PRESERVE cross-turn memory
-        "entity_memory": state.get("entity_memory", {
-            "last_entity": None,
-            "last_entities": [],
-            "last_task": None,
-            "last_result": None
-        }),
-        "session_cache": state.get("session_cache", {}),
-        "prior_entity_results": state.get("prior_entity_results", [])
+        "intent": ""
+        # entity_memory is preserved (no reducer, so last value wins)
+        # session_cache is preserved and merged (merge_dicts reducer)
+        # step_outputs will be overwritten by new tool outputs (merge_dicts reducer)
+        # messages are preserved and appended (add reducer)
     }
 
 # query_resolver
@@ -235,10 +233,15 @@ async def fetch_news_node(state):
             result,source=cached_val,"cache"
         else: result,source=await fetch_news_async(query,n)
     else: result,source=await fetch_news_async(query,n)
-    if result: session_cache[cache_key]=(result,time.time())
+    
+    # Note: We don't return session_cache here to avoid concurrent update errors
+    # Cache will be managed at the app level in ui/app.py
+    
+    # Build step output
     existing=dict(full_state.get("step_outputs",{}))
-    existing[step["step"]]={"step_index":step["step"],"tool":"fetch_news","params":step["params"],"result":result,"status":"success" if result else "empty","source":source}
-    return {"step_outputs":existing,"session_cache":session_cache}
+    existing[step["step"]]={"step_index":step["step"],"tool":"fetch_news","params":step["params"],"result":result,"status":"success" if result else "empty","source":source,"cache_key":cache_key if result else None,"cache_value":(result,time.time()) if result else None}
+    
+    return {"step_outputs":existing}
 
 # analyze_text_node
 def analyze_text_node(state):
