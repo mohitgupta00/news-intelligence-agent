@@ -85,7 +85,7 @@ def extract_entities_from_query(query):
         if result.entities: return result.entities[:5]
     except: pass
     words=query.split()
-    return [w.strip("'\",." for w in words if len(w)>3 and w[0].isupper() and w not in {"What","Where","When","Who","Why","How","The","This","That","These","Those","Will","Does"}][:5]
+    return [w.strip("'\",.") for w in words if len(w)>3 and w[0].isupper() and w not in {"What","Where","When","Who","Why","How","The","This","That","These","Those","Will","Does"}][:5]
 
 # Temporal helpers
 TEMPORAL_PATTERNS=[r'this\s+(week|month|year|day)',r'latest\s+news',r'recent',r'latest',r'today',r'yesterday',r'past\s+\d+\s+(days?|weeks?|months?|years?)',r'last\s+\d+\s+(days?|weeks?|months?|years?)']
