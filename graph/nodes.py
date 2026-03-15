@@ -89,7 +89,7 @@ def extract_entities_from_query(query):
 
 # Temporal helpers
 TEMPORAL_PATTERNS=[r'this\s+(week|month|year|day)',r'latest\s+news',r'recent',r'latest',r'today',r'yesterday',r'past\s+\d+\s+(days?|weeks?|months?|years?)',r'last\s+\d+\s+(days?|weeks?|months?|years?)']
-PRONOUN_PATTERNS=[r'\b(it|this|that|them|their|these)\b',r'\b(one|which)\b']
+PRONOUN_PATTERNS=[r'\b(he|his|him|she|her|it|its|they|them|their|this|that|these|those)\b',r'\b(one|which)\b']
 
 def extract_temporal_constraint(query):
     for p in TEMPORAL_PATTERNS:
@@ -113,8 +113,28 @@ def guard_node(state):
 
 # turn_initializer
 def turn_initializer(state):
-    """Resets per-turn state."""
-    return {"plan":[],"step_outputs":{},"session_cache":{},"current_step":0,"replan_count":0,"replan_decision":None,"final_answer":None,"planning_done":False,"temporal_constraint":None,"api_queries":[],"intent":""}
+    """Resets per-turn state, preserving session memory across turns."""
+    return {
+        "plan": [],
+        "step_outputs": {},
+        "current_step": 0,
+        "replan_count": 0,
+        "replan_decision": None,
+        "final_answer": None,
+        "planning_done": False,
+        "temporal_constraint": None,
+        "api_queries": [],
+        "intent": "",
+        # PRESERVE cross-turn memory
+        "entity_memory": state.get("entity_memory", {
+            "last_entity": None,
+            "last_entities": [],
+            "last_task": None,
+            "last_result": None
+        }),
+        "session_cache": state.get("session_cache", {}),
+        "prior_entity_results": state.get("prior_entity_results", [])
+    }
 
 # query_resolver
 def query_resolver(state):
@@ -124,24 +144,48 @@ def query_resolver(state):
     last_entity=em.get("last_entity","")
     last_entities=em.get("last_entities",[])
     last_task=em.get("last_task","")
+    last_result=em.get("last_result","")
+    
+    # Check if query needs context resolution (pronouns OR follow-up indicators)
     needs_res=contains_pronoun_reference(query)
-    if not last_entity or not needs_res: resolved=query
+    
+    # Detect follow-up patterns even without pronouns
+    follow_up_patterns=[r'^what about',r'^how about',r'^and (what|how)',r'connection',r'stance',r'position',r'view',r'opinion']
+    is_follow_up=any(re.search(p,query.lower()) for p in follow_up_patterns)
+    
+    if not last_entity or (not needs_res and not is_follow_up): 
+        resolved=query
     else:
-        context=f"Previous entities: {', '.join(last_entities) if last_entities else last_entity}"
-        prompt=f"{context}\nLast task: {last_task}\nCurrent query: \"{query}\"\nRewrite to be fully self-contained. Return only the rewritten string."
+        # Build rich context for resolution
+        context_parts=[]
+        if last_entities:
+            context_parts.append(f"Previous topic: {', '.join(last_entities)}")
+        elif last_entity:
+            context_parts.append(f"Previous topic: {last_entity}")
+        if last_task:
+            context_parts.append(f"Previous task: {last_task}")
+        if last_result:
+            # Include snippet of last result for better context
+            context_parts.append(f"Previous answer snippet: {last_result[:200]}...")
+        
+        context="\n".join(context_parts)
+        prompt=f"{context}\n\nCurrent query: \"{query}\"\n\nRewrite the query to be fully self-contained by incorporating the previous context. Include all necessary entity names. Return ONLY the rewritten query string."
+        
         cached=_get_llm_cache(prompt)
-        if cached: resolved=cached
+        if cached: 
+            resolved=cached
         else:
             resp=_groq_client.chat.completions.create(model=GROQ_MODEL,messages=[{"role":"user","content":prompt}],temperature=0.1)
             resolved=(resp.choices[0].message.content or query).strip()
             _set_llm_cache(prompt,resolved)
+    
     return {"resolved_query":resolved,"temporal_constraint":temporal}
 
 # query_rewriter (structured output)
 def query_rewriter(state):
     resolved=state["resolved_query"]
     structured=_chat_groq.with_structured_output(QueryAnalysis)
-    prompt=f"Analyze user query and determine:\n1. intent: summarize|sentiment|timeline|compare|extract_entities\n2. api_queries: 1-3 clean 2-5 word keyword strings\n\nCRITICAL: for compare queries with 2 entities, produce EXACTLY 2 separate queries.\n\nExamples:\n  'Compare Google and Microsoft' -> intent=compare, api_queries=['Google news','Microsoft news']\n  'Summarize latest OpenAI news' -> intent=summarize, api_queries=['OpenAI news']\n\nUser query: \"{resolved}\""
+    prompt=f"Analyze user query and determine:\n1. intent: summarize|sentiment|timeline|compare|extract_entities\n   - Use 'summarize' for ALL informational, factual, multi-part, or mixed queries (DEFAULT)\n   - Use 'sentiment' ONLY when user uses words like: sentiment, opinion, reception, how is X perceived, what do people think\n   - NEVER use 'sentiment' for 'what happened', 'what is X doing', 'tell me about' queries\n2. api_queries: 1-3 clean 2-5 word keyword strings\n   - Each query MUST include the main entity name (e.g. 'Trump Epstein files' not 'Epstein connection')\n   - For multi-part queries, generate one focused query per sub-topic\n\nCRITICAL: for compare queries with 2 entities, produce EXACTLY 2 separate queries.\n\nExamples:\n  'Compare Google and Microsoft' -> intent=compare, api_queries=['Google news','Microsoft news']\n  'Summarize latest OpenAI news' -> intent=summarize, api_queries=['OpenAI news']\n  'What is Trump doing? What about his Epstein connection?' -> intent=summarize, api_queries=['Trump latest news','Trump Epstein files']\n  'What happened to his epstein connection?' -> intent=summarize, api_queries=['Trump Epstein files']\n\nUser query: \"{resolved}\""
     try:
         result=structured.invoke(prompt)
         return {"intent":result.intent,"api_queries":result.api_queries or [resolved]}
@@ -270,20 +314,36 @@ def synthesizer(state):
     intent=state.get("intent","summarize")
     entity_memory=state.get("entity_memory",{})
     step_outputs=state.get("step_outputs",{})
+    
     if state.get("replan_decision")=="out_of_scope":
         return _build_response("I'm a news analysis assistant and don't handle prediction questions like stock prices or investment advice. I can help with news summaries, sentiment analysis, entity comparisons, and timelines. Try that?",state)
+    
     all_empty=all(v.get("status")=="empty" for v in step_outputs.values()) if step_outputs else True
-    if all_empty: return _build_response("I wasn't able to find news articles about this query. Try rephrasing.",state)
+    if all_empty: 
+        return _build_response("I wasn't able to find news articles about this query. Try rephrasing.",state)
+    
     last_result=entity_memory.get("last_result","")
-    if last_result and _prior_covers_query(resolved,last_result):
+    
+    # Check if this is a NEW information request (follow-up asking about different aspect)
+    # Don't use prior result if query contains new topics/entities
+    new_info_patterns=[r'what about',r'how about',r'connection',r'stance',r'position',r'view',r'opinion',r'relation']
+    is_new_info_request=any(re.search(p,state.get("user_query","").lower()) for p in new_info_patterns)
+    
+    # Only use prior result if it's a clarification/rephrasing of the SAME query
+    if last_result and not is_new_info_request and _prior_covers_query(resolved,last_result):
         prior_prompt=f"Answer this question using only the prior result below.\nQuestion: {resolved}\nPrior result: {last_result}\nGive a direct, concise answer."
         return _build_response(_analyze_with_best_model(prior_prompt),state)
+    
+    # Build response from fresh results
     all_results=[f"Step {k} ({v.get('tool','?')}): {v.get('result','')}" for k,v in sorted(step_outputs.items())]
     combined="\n\n".join(all_results)
+    
     prior_ctx=""
     for pe in state.get("prior_entity_results",[]):
         prior_ctx+=f"- {pe['entity']}: {pe['result'][:500]}\n"
-    if prior_ctx: combined+=f"\n\nPrevious context:\n{prior_ctx}"
+    if prior_ctx: 
+        combined+=f"\n\nPrevious context:\n{prior_ctx}"
+    
     prompt=f"Original query: {resolved}\n\nResearch outputs:\n{combined}\n\nWrite a clear, structured answer. Be concise but informative."
     return _build_response(_analyze_with_best_model(prompt),state)
 
