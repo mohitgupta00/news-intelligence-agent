@@ -12,7 +12,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from graph.builder import graph
 from memory.checkpointer import get_thread_config
-from tools.fetch_news import clear_cache
 
 # Session timeout: 1 hour
 SESSION_TIMEOUT_SECONDS = 3600
