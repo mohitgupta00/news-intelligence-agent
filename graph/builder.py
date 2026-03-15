@@ -32,14 +32,10 @@ def build_graph():
     return builder
 
 def compile_graph():
-    builder=build_graph()
-    db_path=os.environ.get("CHECKPOINT_DB","newsiq_checkpoints.db")
-    try:
-        from langgraph.checkpoint.sqlite import SqliteSaver
-        checkpointer=SqliteSaver.from_conn_string(db_path)
-    except Exception:
-        from langgraph.checkpoint.memory import MemorySaver
-        checkpointer=MemorySaver()
+    builder = build_graph()
+    # Use MemorySaver for simplicity and reliability
+    from langgraph.checkpoint.memory import MemorySaver
+    checkpointer = MemorySaver()
     return builder.compile(checkpointer=checkpointer)
 
 graph=compile_graph()
