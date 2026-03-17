@@ -74,6 +74,7 @@ def init_session():
 def process_query(query: str) -> str:
     state = st.session_state.state
     state['user_query'] = query
+    state['thread_id'] = st.session_state.thread_id  # Add thread_id to state
     config = get_thread_config(st.session_state.thread_id)
     result = asyncio.get_event_loop().run_until_complete(graph.ainvoke(state, config))
     
@@ -141,6 +142,14 @@ def main():
             if entity_mem.get('last_task'):
                 st.caption(f"Last task: {entity_mem['last_task']}")
         
+        # Show search memory stats
+        search_stats = st.session_state.state.get('search_memory_stats', {})
+        if search_stats.get('total_searches', 0) > 0:
+            st.markdown("### 💾 Search Memory")
+            st.caption(f"Cached searches: {search_stats['total_searches']}")
+            st.caption(f"Memory usage: {search_stats['memory_size_kb']} KB")
+            if st.session_state.state.get('search_memory_reused'):
+                st.success("♻️ Reused previous results")
         st.markdown("---")
         st.markdown("### 📡 Sources")
         st.markdown("- **NewsAPI** (primary)")

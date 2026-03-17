@@ -1,4 +1,8 @@
 import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 GROQ_API_KEY    = os.environ.get("GROQ_API_KEY")
 GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY")  # Optional
