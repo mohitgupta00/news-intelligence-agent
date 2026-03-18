@@ -24,21 +24,34 @@ class IntelligentRouter:
         
         memory_context = self._format_memory(conversation_memory or {})
         
-        prompt = f"""You are NewsIQ, a professional news reporter and intelligence assistant.
+        prompt = f"""You are NewsIQ Router - a specialized news intelligence reporter.
 
-YOUR ROLE: Analyze current events, breaking news, political developments, business trends, and provide factual reporting.
+CORE FUNCTION: Route queries to news research OR decline non-news requests.
 
-DECISION RULES:
-✅ DIRECT RESPONSE (direct_response):
-- System capabilities: "what can you do?", "your purpose", "how do you work?"
-- Out-of-scope: cooking recipes, math problems, poetry, personal advice, how-to guides
-- Examples: "how to make pizza?", "solve 2+2", "write a poem", "relationship advice"
+STRICT RULES:
+✅ DELEGATE TO RESEARCH (delegate_to_graph):
+- Specific news topics: "Tesla earnings", "Ukraine conflict updates"
+- Named entities + news context: "Biden policy changes", "Apple stock news"
+- Current events: "election results", "market crash", "breaking news about X"
 
-✅ NEWS RESEARCH (delegate_to_graph):  
-- Current events: "latest updates on...", "what's happening with..."
-- Political analysis: "election results", "policy changes", "government decisions"
-- Business news: "company earnings", "market trends", "industry developments"
-- Examples: "israel iran conflict", "tech industry news", "tesla stock news"
+✅ HANDLE DIRECTLY (direct_response):
+- System queries: "what can you do", "who are you", "your capabilities"
+- Decline ALL non-news: math, recipes, creative writing, general knowledge, health advice
+- Clarify vague queries: "what happened", "latest news" (without specific topic)
+
+DO NOT:
+- Route general knowledge questions to research
+- Handle math, recipes, creative tasks, or personal advice
+- Accept vague queries without specific news topics
+- Provide opinions or speculation
+
+AMBIGUITY RULE: If query lacks specific news topic/entity, ask for clarification.
+
+EXAMPLES:
+"how to make pizza?" → direct_response (decline: recipe)
+"Tesla stock news" → delegate_to_graph (specific news topic)
+"what happened yesterday?" → direct_response (clarify: too vague)
+"who are you?" → direct_response (system query)
 
 {memory_context}
 
@@ -46,12 +59,12 @@ User Query: "{user_query}"
 
 IMPORTANT: If there's previous conversation context and the query references it ("this topic", "on this", "reactions", "what about"), ALWAYS delegate to graph for fresh analysis.
 
-Respond with JSON:
+Respond with valid JSON:
 {{
     "action": "direct_response" | "delegate_to_graph",
-    "response": "your direct answer (if direct_response)" | null,
-    "graph_query": null | "reformulated query for graph execution",
-    "reasoning": "brief explanation of your decision"
+    "response": "your response text" | null,
+    "graph_query": "reformulated query" | null,
+    "reasoning": "brief explanation"
 }}"""
 
         try:
@@ -112,7 +125,7 @@ Respond with JSON:
         if any(pattern in query_lower for pattern in out_of_scope_patterns):
             return RouterDecision(
                 action="direct_response", 
-                response="I'm NewsIQ, focused on news analysis and current events. I can't help with that topic, but I'd be happy to discuss any recent news or developments!",
+                response="I'm a news intelligence reporter, focused on news analysis and current events. I can't help with that topic, but I'd be happy to discuss any recent news or developments!",
                 reasoning="Out-of-scope query detected (fallback)"
             )
         
