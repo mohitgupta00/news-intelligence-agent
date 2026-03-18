@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from graph.builder import graph
 from memory.checkpointer import get_thread_config
+from main_orchestrator import orchestrator
 
 # Session timeout: 1 hour
 SESSION_TIMEOUT_SECONDS = 3600
@@ -71,33 +72,16 @@ def init_session():
         reset_session()
         st.info("⏱️ Session timed out after 1 hour of inactivity. Starting fresh.")
 
-def process_query(query: str) -> str:
-    state = st.session_state.state
-    state['user_query'] = query
-    state['thread_id'] = st.session_state.thread_id  # Add thread_id to state
-    config = get_thread_config(st.session_state.thread_id)
-    result = asyncio.get_event_loop().run_until_complete(graph.ainvoke(state, config))
-    
-    # Update session_cache from step_outputs (to avoid concurrent update errors)
-    if 'step_outputs' in result:
-        session_cache = result.get('session_cache', {})
-        for step_output in result['step_outputs'].values():
-            if step_output.get('cache_key') and step_output.get('cache_value'):
-                session_cache[step_output['cache_key']] = step_output['cache_value']
-        result['session_cache'] = session_cache
-    
-    st.session_state.state = result
+def process_query(query: str) -> dict:
+    """Process query through orchestrator and return result with routing info."""
+    result = asyncio.get_event_loop().run_until_complete(
+        orchestrator.process_query(query, st.session_state.thread_id)
+    )
     
     # Update last activity timestamp
     st.session_state.last_activity = time.time()
     
-    if result.get('messages'):
-        for msg in result['messages']:
-            st.session_state.history.append({
-                'role': msg.get('role', 'assistant'),
-                'content': msg.get('content', '')
-            })
-    return result.get('final_answer', 'I apologize, but I could not generate a response.')
+    return result
 
 def main():
     st.set_page_config(
@@ -186,9 +170,28 @@ def main():
             st.markdown(prompt)
         
         with st.chat_message("assistant"):
-            with st.spinner("🔍 Researching..."):
-                response = process_query(prompt)
+            with st.spinner("🔍 Analyzing..."):
+                result = process_query(prompt)
+                response = result['response']
+                
+                # Display response
                 st.markdown(response)
+                
+                # Show routing decision for demo purposes
+                with st.expander("🔍 System Decision (Demo Info)", expanded=False):
+                    st.write(f"**Routing Decision:** {result['routing_decision']}")
+                    st.write(f"**Reasoning:** {result['reasoning']}")
+                    if result['routing_decision'] == 'direct_response':
+                        st.success("✅ Handled directly by LLM router")
+                    else:
+                        st.info("🔄 Processed through graph pipeline")
+                
+                # Add to history
+                st.session_state.history.append({
+                    'role': 'assistant',
+                    'content': response,
+                    'routing': result['routing_decision']
+                })
 
 if __name__ == "__main__":
     main()
