@@ -24,19 +24,21 @@ class IntelligentRouter:
         
         memory_context = self._format_memory(conversation_memory or {})
         
-        prompt = f"""You are NewsIQ, an AI news intelligence assistant. Analyze this query and decide how to handle it.
+        prompt = f"""You are NewsIQ, a professional news reporter and intelligence assistant.
 
-HANDLE DIRECTLY if:
-- System capability questions ("what can you do?", "how do you work?")
-- Greetings, thanks, or casual conversation
-- Out-of-scope requests (investment advice, stock predictions, personal questions)
+YOUR ROLE: Analyze current events, breaking news, political developments, business trends, and provide factual reporting.
 
-DELEGATE TO GRAPH if:
-- News analysis needed (summaries, sentiment, timelines, comparisons)
-- Current events or information requests
-- Follow-up questions that need fresh news data
-- Questions about reactions, opinions, or responses to current events
-- Any query that references "this topic", "on this", "about this" when there's previous context
+DECISION RULES:
+✅ DIRECT RESPONSE (direct_response):
+- System capabilities: "what can you do?", "your purpose", "how do you work?"
+- Out-of-scope: cooking recipes, math problems, poetry, personal advice, how-to guides
+- Examples: "how to make pizza?", "solve 2+2", "write a poem", "relationship advice"
+
+✅ NEWS RESEARCH (delegate_to_graph):  
+- Current events: "latest updates on...", "what's happening with..."
+- Political analysis: "election results", "policy changes", "government decisions"
+- Business news: "company earnings", "market trends", "industry developments"
+- Examples: "israel iran conflict", "tech industry news", "tesla stock news"
 
 {memory_context}
 
@@ -69,12 +71,64 @@ Respond with JSON:
             return RouterDecision(**decision_data)
             
         except Exception as e:
-            # Fallback: delegate to graph for safety
+            # Enhanced fallback: intelligent rule-based classification
+            return self._fallback_routing(user_query, str(e))
+    
+    def _fallback_routing(self, query: str, error: str) -> RouterDecision:
+        """Intelligent rule-based fallback when LLM routing fails."""
+        query_lower = query.lower().strip()
+        
+        # Out-of-scope patterns
+        out_of_scope_patterns = [
+            'recipe', 'cook', 'bake', 'ingredient', 'food preparation',
+            'math', 'calculate', 'solve', 'equation', 'arithmetic',
+            'poem', 'story', 'creative writing', 'fiction', 'lyrics',
+            'personal advice', 'relationship', 'dating', 'health advice',
+            'how to', 'tutorial', 'guide', 'instructions', 'diy'
+        ]
+        
+        # System capability patterns  
+        capability_patterns = [
+            'what can you do', 'what are you', 'your purpose', 'your role',
+            'capabilities', 'help with', 'supposed to do', 'designed for'
+        ]
+        
+        # News patterns
+        news_patterns = [
+            'news', 'latest', 'update', 'happening', 'current', 'recent',
+            'politics', 'political', 'election', 'government', 'policy',
+            'war', 'conflict', 'crisis', 'economy', 'economic', 'market',
+            'business', 'company', 'industry', 'technology', 'tech'
+        ]
+        
+        # Check patterns in order of specificity
+        if any(pattern in query_lower for pattern in capability_patterns):
+            return RouterDecision(
+                action="direct_response",
+                response=None,  # Will trigger system capabilities
+                reasoning="System capability question detected (fallback)"
+            )
+        
+        if any(pattern in query_lower for pattern in out_of_scope_patterns):
+            return RouterDecision(
+                action="direct_response", 
+                response="I'm NewsIQ, focused on news analysis and current events. I can't help with that topic, but I'd be happy to discuss any recent news or developments!",
+                reasoning="Out-of-scope query detected (fallback)"
+            )
+        
+        if any(pattern in query_lower for pattern in news_patterns):
             return RouterDecision(
                 action="delegate_to_graph",
-                graph_query=user_query,
-                reasoning=f"Router error, defaulting to graph: {str(e)}"
+                graph_query=query,
+                reasoning="News-related query detected (fallback)"
             )
+        
+        # Default: delegate to graph for safety (but indicate uncertainty)
+        return RouterDecision(
+            action="delegate_to_graph",
+            graph_query=query,
+            reasoning=f"Uncertain classification, defaulting to graph. Router error: {error}"
+        )
     
     def _format_memory(self, memory: dict) -> str:
         """Format conversation memory for prompt context."""

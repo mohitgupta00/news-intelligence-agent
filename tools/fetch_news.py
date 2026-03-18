@@ -66,18 +66,36 @@ async def _call_gnews_async(session, query, n):
     except Exception as e:
         logger.warning(f"GNews err: {e}"); return None
 
-async def fetch_news_async(query, n=5):
-    """Concurrent fetch from all 3 sources via aiohttp."""
+async def fetch_news_async(query, n=5, max_retries=2):
+    """Enhanced fetch with retry logic and validation."""
+    
+    async def try_source_with_retry(source_func, session, query, n):
+        for attempt in range(max_retries):
+            try:
+                result = await source_func(session, query, n)
+                if result and len(result.strip()) > 50:  # Basic quality check
+                    return result
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logger.warning(f"Source failed after {max_retries} attempts: {e}")
+                await asyncio.sleep(0.5 * (attempt + 1))  # Backoff
+        return None
+    
     async with aiohttp.ClientSession() as session:
-        results=await asyncio.gather(
-            _call_newsapi_async(session,query,n),
-            _call_newsdata_async(session,query,n),
-            _call_gnews_async(session,query,n),
-            return_exceptions=True)
-    for result,source in zip(results,["newsapi","newsdata","gnews"]):
-        if isinstance(result,str) and result and not _is_likely_hallucinated(result):
-            return result,source
-    return "","empty"
+        # Try sources in priority order
+        sources = [
+            (_call_newsapi_async, "newsapi"),
+            (_call_newsdata_async, "newsdata"), 
+            (_call_gnews_async, "gnews")
+        ]
+        
+        for source_func, source_name in sources:
+            result = await try_source_with_retry(source_func, session, query, n)
+            if result and not _is_likely_hallucinated(result):
+                return result, source_name
+    
+    # All sources failed - return helpful fallback
+    return "No recent news articles found for this query. Please try a different search term or check back later.", "fallback"
 
 def fetch_news(query, n=5):
     """Sync wrapper for backward-compat."""

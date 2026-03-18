@@ -71,10 +71,19 @@ def contains_pronoun_reference(query: str) -> bool:
 
 def turn_initializer(state):
     """Reset per-turn state while preserving session memory and search history."""
-    # Check if we can reuse previous search results
-    thread_id = state.get('thread_id', 'default')
-    user_query = state.get('user_query', '')
+    # Input validation
+    if not isinstance(state, dict):
+        raise ValueError("State must be a dictionary")
     
+    user_query = state.get('user_query', '')
+    if not user_query or not isinstance(user_query, str):
+        raise ValueError("user_query must be a non-empty string")
+    
+    thread_id = state.get('thread_id', 'default')
+    if not isinstance(thread_id, str):
+        raise ValueError("thread_id must be a string")
+    
+    # Check if we can reuse previous search results
     should_reuse, relevant_results = should_reuse_search_results(user_query, thread_id)
     
     # Get search memory stats for debugging
@@ -117,6 +126,16 @@ def turn_initializer(state):
 
 def query_resolver(state):
     """Resolve query with context and caching."""
+    # Input validation
+    if not isinstance(state, dict):
+        raise ValueError("State must be a dictionary")
+    
+    if "entity_memory" not in state or not isinstance(state["entity_memory"], dict):
+        raise ValueError("entity_memory must be a dictionary")
+    
+    if "user_query" not in state or not isinstance(state["user_query"], str):
+        raise ValueError("user_query must be a string")
+    
     em = state["entity_memory"]
     query = state["user_query"]
     temporal = extract_temporal_constraint(query)

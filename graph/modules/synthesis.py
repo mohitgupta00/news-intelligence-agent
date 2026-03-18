@@ -4,11 +4,25 @@ import re
 from tools.analyze_text import _analyze_with_best_model
 from utils.text_processing import extract_relevant_chunks
 
-def _prior_covers_query(query, last_result, threshold=0.82):
+def _prior_covers_query(query, last_result, threshold=0.90):
     """Check if prior result covers current query using similarity."""
-    if not last_result:
+    if not last_result or not query:
         return False
     
+    # Entity-specific validation
+    query_lower = query.lower()
+    result_lower = last_result.lower()
+    
+    # Extract key entities from both
+    important_entities = ["trump", "biden", "israel", "iran", "tesla", "apple", "google", "microsoft"]
+    query_entities = [e for e in important_entities if e in query_lower]
+    result_entities = [e for e in important_entities if e in result_lower]
+    
+    # If query has specific entities not in result, don't reuse
+    if query_entities and not any(e in result_entities for e in query_entities):
+        return False
+    
+    # Stricter similarity threshold
     try:
         from utils.text_processing import get_embedder, cosine_similarity
         embedder = get_embedder()
@@ -18,9 +32,9 @@ def _prior_covers_query(query, last_result, threshold=0.82):
     except:
         pass
     
-    # Keyword fallback
+    # More conservative keyword fallback
     def tokenize(text):
-        return set(re.findall(r'\b\w{3,}\b', text.lower()))
+        return set(re.findall(r'\b\w{4,}\b', text.lower()))
     
     query_tokens = tokenize(query)
     result_tokens = tokenize(last_result[:400])
@@ -29,7 +43,7 @@ def _prior_covers_query(query, last_result, threshold=0.82):
         return False
     
     overlap = len(query_tokens & result_tokens)
-    return overlap / len(query_tokens) >= 0.45
+    return overlap / len(query_tokens) >= 0.70  # Much stricter
 
 def extract_entities_from_query(query):
     """Extract named entities from query using spaCy or fallback methods."""
