@@ -3,7 +3,7 @@
 import time
 import asyncio
 from config import CACHE_TTL_SECONDS
-from tools.fetch_news import fetch_news_async, _is_likely_hallucinated
+from tools.fetch_news import fetch_news_with_fallback, _is_likely_hallucinated
 from tools.analyze_text import summarize_articles, analyze_sentiment, extract_entities, analyze_timeline
 from tools.compare_entities import compare_entities
 from utils.search_memory import store_search_result
@@ -23,6 +23,7 @@ async def fetch_news_node(state):
     
     query = step["params"].get("query", "")
     n = step["params"].get("n", 5)
+    preferred_sources = step["params"].get("preferred_sources", None)
     session_cache = dict(full_state.get("session_cache", {}))
     
     cache_key = f"fetch::{query}::{n}"
@@ -34,9 +35,9 @@ async def fetch_news_node(state):
             and not _is_likely_hallucinated(cached_value)):
             result, source = cached_value, "cache"
         else:
-            result, source = await fetch_news_async(query, n)
+            result, source = await fetch_news_with_fallback(query, n, preferred_sources)
     else:
-        result, source = await fetch_news_async(query, n)
+        result, source = await fetch_news_with_fallback(query, n, preferred_sources)
     
     # Store successful results in persistent memory
     if result and source != "cache":

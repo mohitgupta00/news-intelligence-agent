@@ -45,7 +45,112 @@ def _prior_covers_query(query, last_result, threshold=0.90):
     overlap = len(query_tokens & result_tokens)
     return overlap / len(query_tokens) >= 0.70  # Much stricter
 
-def extract_entities_from_query(query):
+def generate_contextual_analysis(query: str, context_entities: list, active_entities: list, intent: str) -> str:
+    """Generate contextual analysis when direct search results are unavailable."""
+    
+    # Extract key components from query
+    query_lower = query.lower()
+    all_entities = list(set(context_entities + active_entities))
+    
+    # Identify query type and provide contextual insights
+    if any(word in query_lower for word in ['impact', 'affect', 'influence', 'consequence']):
+        # Impact analysis
+        if len(all_entities) >= 2:
+            primary_entity = all_entities[0]
+            secondary_entity = all_entities[1]
+            
+            # Generate logical impact analysis
+            impact_areas = {
+                'economic': ['trade', 'market', 'economy', 'business', 'financial'],
+                'diplomatic': ['relations', 'policy', 'government', 'alliance', 'treaty'],
+                'technological': ['innovation', 'development', 'research', 'ai', 'tech'],
+                'geopolitical': ['security', 'military', 'defense', 'conflict', 'war']
+            }
+            
+            relevant_areas = []
+            for area, keywords in impact_areas.items():
+                if any(keyword in query_lower for keyword in keywords):
+                    relevant_areas.append(area)
+            
+            if not relevant_areas:
+                relevant_areas = ['economic', 'diplomatic']  # Default areas
+            
+            analysis = f"While I don't have specific recent news about {query}, I can provide contextual analysis:\n\n"
+            analysis += f"**Potential {primary_entity}-{secondary_entity} Impact Areas:**\n"
+            
+            for area in relevant_areas[:2]:  # Limit to 2 areas
+                if area == 'economic':
+                    analysis += f"• **Economic**: Trade relationships, market dynamics, and business partnerships could be affected\n"
+                elif area == 'diplomatic':
+                    analysis += f"• **Diplomatic**: Government relations and policy coordination may see changes\n"
+                elif area == 'technological':
+                    analysis += f"• **Technological**: Innovation partnerships and tech development could be influenced\n"
+                elif area == 'geopolitical':
+                    analysis += f"• **Geopolitical**: Security considerations and strategic alignments may shift\n"
+            
+            analysis += f"\n*Note: This analysis is based on general relationship patterns. For specific recent developments, try searching for broader terms like '{primary_entity} {secondary_entity}' or '{primary_entity} news'.*"
+            return analysis
+    
+    elif any(word in query_lower for word in ['response', 'reaction', 'stance', 'position']):
+        # Response/reaction analysis
+        if all_entities:
+            entity = all_entities[0]
+            analysis = f"While I don't have specific recent statements from {entity} about this topic, typical response patterns might include:\n\n"
+            analysis += f"• **Official statements** through government channels or corporate communications\n"
+            analysis += f"• **Policy adjustments** or strategic positioning changes\n"
+            analysis += f"• **Stakeholder engagement** and public messaging\n\n"
+            analysis += f"*For the most current {entity} response, try searching for '{entity} statement' or '{entity} official response'.*"
+            return analysis
+    
+    elif any(word in query_lower for word in ['compare', 'comparison', 'versus', 'vs', 'difference']):
+        # Comparison analysis
+        if len(all_entities) >= 2:
+            entity1, entity2 = all_entities[0], all_entities[1]
+            analysis = f"While I don't have recent comparative news about {entity1} vs {entity2}, here are typical comparison dimensions:\n\n"
+            analysis += f"• **Market position** and competitive strategies\n"
+            analysis += f"• **Innovation approaches** and technological focus\n"
+            analysis += f"• **Business models** and operational differences\n\n"
+            analysis += f"*For current comparative analysis, try searching for '{entity1} {entity2} comparison' or individual searches for each entity.*"
+            return analysis
+    
+    # Generic contextual fallback
+    if all_entities:
+        entities_str = ', '.join(all_entities[:3])
+        analysis = f"I couldn't find specific recent news for your query about {entities_str}. "
+        analysis += f"This could be because:\n\n"
+        analysis += f"• The topic is very recent and hasn't been widely covered yet\n"
+        analysis += f"• The specific angle you're asking about may need broader search terms\n"
+        analysis += f"• The entities mentioned may not be directly connected in recent news\n\n"
+        analysis += f"**Suggestions:**\n"
+        analysis += f"• Try broader searches like '{all_entities[0]} news' or '{all_entities[0]} updates'\n"
+        if len(all_entities) > 1:
+            analysis += f"• Search for individual entities separately: '{all_entities[0]}' and '{all_entities[1]}'\n"
+        analysis += f"• Use different keywords or rephrase your question\n"
+        return analysis
+    
+    # Final fallback
+    return "I wasn't able to find recent news articles for this specific query. Try rephrasing with different keywords or broader terms, and I'll search again."
+
+def has_meaningful_results(step_outputs: dict) -> bool:
+    """Check if step outputs contain meaningful results beyond basic failures."""
+    if not step_outputs:
+        return False
+    
+    for output in step_outputs.values():
+        result = output.get('result', '')
+        status = output.get('status', '')
+        
+        # Check for meaningful content
+        if (status == 'success' and result and 
+            len(result.strip()) > 100 and 
+            not any(phrase in result.lower() for phrase in [
+                'no recent news', 'no articles found', 'try a different search',
+                'no information found', 'please try again'
+            ])):
+            return True
+    
+    return False
+def extract_entities_from_query(query: str) -> list:
     """Extract named entities from query using spaCy or fallback methods."""
     try:
         import spacy
@@ -99,17 +204,31 @@ def synthesizer(state):
             state
         )
     
-    # Handle empty results
+    # Check if all step outputs are empty or failed
     all_empty = all(
-        output.get("status") == "empty" 
+        output.get('status') == 'empty' or not output.get('result', '').strip()
         for output in step_outputs.values()
     ) if step_outputs else True
     
-    if all_empty:
-        return _build_response(
-            "I wasn't able to find news articles about this query. Try rephrasing.",
-            state
+    # Handle empty results with contextual analysis
+    if all_empty or not has_meaningful_results(step_outputs):
+        # Get available context for analysis
+        context_entities = entity_memory.get('last_entities', [])
+        active_entities = state.get('active_entities', [])
+        extracted_entities = state.get('extracted_entities', [])
+        
+        # Combine all available entities
+        all_available_entities = list(set(context_entities + active_entities + extracted_entities))
+        
+        # Generate contextual analysis instead of generic "not found" message
+        contextual_response = generate_contextual_analysis(
+            resolved, 
+            context_entities, 
+            all_available_entities, 
+            intent
         )
+        
+        return _build_response(contextual_response, state)
     
     last_result = entity_memory.get("last_result", "")
     

@@ -21,6 +21,15 @@ class NewsIQOrchestrator:
     
     def _create_complete_graph_state(self, query: str, thread_id: str, memory: dict) -> dict:
         """Create complete graph state with all required fields."""
+        # Build conversation history from memory
+        conversation_history = []
+        if memory:
+            if memory.get('last_query') and memory.get('last_entities'):
+                conversation_history.append({
+                    'query': memory['last_query'],
+                    'entities': memory['last_entities']
+                })
+        
         return {
             'user_query': query,
             'thread_id': thread_id,
@@ -29,22 +38,33 @@ class NewsIQOrchestrator:
             'api_queries': [],
             'intent': '',
             'temporal_constraint': None,
+            
+            # Enhanced tracking
+            'active_entities': [],
+            'search_queries': [],
+            'query_resolution': None,
+            'context_hints': None,
+            'extracted_entities': [],
+            
             'plan': [],
             'current_step': 0,
             'step_outputs': {},
             'planning_done': False,
+            'conversation_history': conversation_history,
             'entity_memory': {
                 'last_entity': None,
                 'last_entities': [],
                 'last_task': None,
                 'last_result': None,
+                'current_entities': [],
                 **memory.get('entity_memory', {})
             },
             'prior_entity_results': [],
             'session_cache': {},
             'replan_count': 0,
             'replan_decision': None,
-            'final_answer': None
+            'final_answer': None,
+            'processing_stats': {}
         }
     
     async def process_query(self, user_query: str, thread_id: str = "default"):
@@ -76,13 +96,22 @@ class NewsIQOrchestrator:
             
         else:
             logger.info("Delegating to graph pipeline for analysis")
-            # Delegate to graph pipeline
+            # Delegate to graph pipeline with router insights
             graph_query = decision.graph_query or user_query
             logger.debug(f"Graph query: '{graph_query}'")
             
-            # FIX: Use complete state initialization
+            # Create context hints from router insights
+            context_hints = {
+                "resolved_entities": decision.resolved_entities,
+                "resolved_topic": decision.resolved_topic,
+                "routing_confidence": decision.routing_confidence,
+                "suggested_sources": decision.suggested_sources
+            }
+            
+            # FIX: Use complete state initialization with router context
             state = self._create_complete_graph_state(graph_query, thread_id, memory)
-            logger.debug(f"Created graph state with {len(state)} fields")
+            state['context_hints'] = context_hints
+            logger.debug(f"Created graph state with router context hints: {context_hints}")
             
             try:
                 graph_start_time = time.time()
