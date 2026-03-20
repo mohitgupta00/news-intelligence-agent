@@ -1,209 +1,250 @@
 """
-LLM-First Router: Intelligent dispatcher for NewsIQ system.
+LLM-First Router: Single-pass intelligent dispatcher with context resolution.
 Decides whether to handle queries directly or delegate to graph pipeline.
 """
 
 import json
+import logging
 from groq import Groq
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Literal, Optional, List
 from config import GROQ_API_KEY, GROQ_MODEL
 
+logger = logging.getLogger(__name__)
+
+# Single-pass routing schema
+class RoutingLogic(BaseModel):
+    routing: Literal["direct_response", "delegate_to_graph"] = Field(
+        description="delegate_to_graph if query requires news/facts/current events. direct_response for greetings/capabilities/out-of-scope."
+    )
+    is_contextual_follow_up: bool = Field(
+        description="True if user refers to previous topics using pronouns like 'he', 'this', 'that', 'the war'."
+    )
+    resolved_query: str = Field(
+        description="Standalone version of user query. Replace pronouns with specific nouns from context. Example: 'What about him?' -> 'Donald Trump stance on Israel-Iran war'."
+    )
+    updated_summary: str = Field(
+        description="Concise 1-sentence summary of conversation's active topic and key entities."
+    )
+    confidence: float = Field(
+        description="Confidence in resolution accuracy (0-1). Use 0.6 if uncertain about pronoun resolution.",
+        ge=0.0, le=1.0
+    )
+
+# Legacy compatibility
 class RouterDecision(BaseModel):
     action: Literal["direct_response", "delegate_to_graph"]
     response: Optional[str] = None
     graph_query: Optional[str] = None
     reasoning: str
-    # Enhanced context passing
     resolved_entities: Optional[List[str]] = None
     resolved_topic: Optional[str] = None
     routing_confidence: Optional[float] = None
     suggested_sources: Optional[List[str]] = None
-    # Neural context fields
-    context_switch_detected: Optional[bool] = None
-    coreference_resolution: Optional[dict] = None
-
-from utils.semantic_context import get_context_manager
-from utils.entity_resolution import get_entity_resolver
 
 class IntelligentRouter:
     def __init__(self):
         self.groq_client = Groq(api_key=GROQ_API_KEY)
-        self.context_manager = get_context_manager()
-        self.entity_resolver = get_entity_resolver()
     
-    def route_query(self, user_query: str, conversation_memory: dict = None) -> RouterDecision:
-        """Enhanced routing with neural context management."""
+    async def resolve_intent_and_context(self, user_query: str, context_summary: str = "") -> RoutingLogic:
+        """Single-pass intent resolution with context management."""
         
-        # Step 1: Advanced entity resolution with coreference
-        conversation_history = self._extract_conversation_history(conversation_memory or {})
-        entity_resolution = self.entity_resolver.resolve_entities(user_query, conversation_history)
+        system_prompt = f"""You are the NewsIQ Intelligence Router. Analyze user intent and maintain neural context.
+
+CURRENT CONTEXT SUMMARY: "{context_summary}"
+
+Your task: Return a JSON object with these EXACT fields:
+{{
+  "routing": "direct_response" or "delegate_to_graph",
+  "is_contextual_follow_up": true or false,
+  "resolved_query": "standalone version of user query",
+  "updated_summary": "1-sentence conversation summary",
+  "confidence": 0.8
+}}
+
+ROUTING RULES:
+- Use "direct_response" for: greetings, capabilities, weather, recipes, math
+- Use "delegate_to_graph" for: news, current events, politics, business
+
+CONTEXT RESOLUTION:
+- If user query has pronouns (he, him, this, that) AND context summary exists: resolve using context
+- If no context or new topic: create fresh standalone query
+- Set is_contextual_follow_up to true only if using context to resolve pronouns
+
+CONFIDENCE SCORING:
+- 0.9: Clear context, obvious resolution
+- 0.7: Good context, likely correct  
+- 0.5: Uncertain, multiple interpretations
+- 0.3: Poor context, fallback needed
+
+EXAMPLES:
+User: "What is Trump doing?" Context: "" 
+→ {{"routing": "delegate_to_graph", "is_contextual_follow_up": false, "resolved_query": "Donald Trump latest news", "updated_summary": "Discussing Donald Trump activities", "confidence": 0.8}}
+
+User: "What about him?" Context: "Discussing Donald Trump activities"
+→ {{"routing": "delegate_to_graph", "is_contextual_follow_up": true, "resolved_query": "Donald Trump latest news", "updated_summary": "Discussing Donald Trump activities", "confidence": 0.9}}
+
+User: "What can you do?" Context: "anything"
+→ {{"routing": "direct_response", "is_contextual_follow_up": false, "resolved_query": "What can you do?", "updated_summary": "System capabilities inquiry", "confidence": 0.95}}
+
+Return ONLY the JSON object, no other text."""
         
-        # Step 2: Neural context switch detection
-        context_switch_result = self.context_manager.update_context(
-            user_query, 
-            [entity.text for entity in entity_resolution.entities]
-        )
+        max_retries = 2
+        for attempt in range(max_retries):
+            try:
+                logger.debug(f"Single-pass resolution attempt {attempt + 1} for: '{user_query}'")
+                
+                response = self.groq_client.chat.completions.create(
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": f"User Query: {user_query}"}
+                    ],
+                    model=GROQ_MODEL,
+                    response_format={"type": "json_object"},
+                    temperature=0.1,
+                    timeout=10,
+                    max_tokens=300
+                )
+                
+                content = response.choices[0].message.content
+                if not content or content.strip() == "":
+                    raise ValueError("Empty response from LLM")
+                
+                # Parse and validate JSON
+                try:
+                    result_json = json.loads(content)
+                except json.JSONDecodeError as e:
+                    logger.error(f"JSON parsing failed: {e}. Content: {content[:100]}")
+                    if attempt == max_retries - 1:
+                        raise
+                    continue
+                
+                # Validate required fields
+                required_fields = ['routing', 'resolved_query', 'updated_summary', 'confidence']
+                missing_fields = [f for f in required_fields if f not in result_json]
+                if missing_fields:
+                    logger.error(f"Missing required fields: {missing_fields}")
+                    if attempt == max_retries - 1:
+                        raise ValueError(f"Missing fields: {missing_fields}")
+                    continue
+                
+                # Create and validate Pydantic model
+                result = RoutingLogic(**result_json)
+                
+                # Sanity checks
+                if not result.resolved_query or result.resolved_query.strip() == "":
+                    logger.warning("Empty resolved_query, using original")
+                    result.resolved_query = user_query
+                    result.confidence = min(result.confidence, 0.6)
+                
+                logger.info(f"Single-pass resolution successful (confidence: {result.confidence:.2f})")
+                return result
+                
+            except Exception as e:
+                error_type = type(e).__name__
+                logger.error(f"Single-pass resolution attempt {attempt + 1} failed ({error_type}): {e}")
+                
+                if attempt == max_retries - 1:
+                    # Final attempt failed, use fallback
+                    logger.warning("All resolution attempts failed, using fallback")
+                    return self._fallback_resolution(user_query, context_summary)
+                
+                # Wait before retry for rate limit errors
+                if "rate" in str(e).lower():
+                    import asyncio
+                    await asyncio.sleep(1)
         
-        # Step 3: Get relevant context using attention mechanism
-        relevant_context = self.context_manager.get_relevant_context(user_query)
-        
-        # Step 4: Enhanced routing decision
-        if self._should_handle_directly(user_query):
-            return self._create_direct_response(user_query)
-        
-        # Step 5: Build enhanced graph query with neural context
-        enhanced_query = self._build_contextual_query(
-            user_query, 
-            entity_resolution, 
-            context_switch_result,
-            relevant_context
-        )
-        
-        # Step 6: Create router decision with neural insights
-        return RouterDecision(
-            action="delegate_to_graph",
-            reasoning=f"Neural analysis: {len(entity_resolution.entities)} entities detected, "
-                     f"context switch: {context_switch_result.switch_type}, "
-                     f"confidence: {entity_resolution.confidence:.2f}",
-            graph_query=enhanced_query,
-            resolved_entities=[entity.text for entity in entity_resolution.entities],
-            resolved_topic=self._infer_topic_from_entities(entity_resolution.entities),
-            routing_confidence=min(entity_resolution.confidence, context_switch_result.confidence),
-            suggested_sources=self._suggest_sources_neural(entity_resolution.entities)
-        )
+        # Should never reach here, but safety fallback
+        return self._fallback_resolution(user_query, context_summary)
     
-    def _fallback_routing(self, query: str, error: str) -> RouterDecision:
-        """Intelligent fallback with basic entity extraction."""
-        query_lower = query.lower().strip()
+    def _fallback_resolution(self, user_query: str, context_summary: str) -> RoutingLogic:
+        """Fallback when LLM resolution fails."""
+        query_lower = user_query.lower().strip()
         
-        # Extract entities using simple patterns
-        entities = self._extract_basic_entities(query)
-        topic = self._extract_basic_topic(query)
-        
-        # Out-of-scope patterns
-        out_of_scope_patterns = [
-            'recipe', 'cook', 'bake', 'math', 'calculate', 'poem', 'story',
-            'personal advice', 'relationship', 'how to', 'tutorial'
-        ]
-        
-        # System capability patterns  
-        capability_patterns = [
-            'what can you do', 'what are you', 'your purpose', 'capabilities'
-        ]
-        
-        # News patterns
-        news_patterns = [
-            'news', 'latest', 'update', 'politics', 'war', 'economy', 'business'
-        ]
-        
-        if any(pattern in query_lower for pattern in capability_patterns):
-            return RouterDecision(
-                action="direct_response",
-                response=None,
-                reasoning="System capability question (fallback)",
-                routing_confidence=0.8
+        # Direct response patterns
+        if any(pattern in query_lower for pattern in [
+            'what can you do', 'capabilities', 'help', 'recipe', 'cook', 'math', 'weather'
+        ]):
+            return RoutingLogic(
+                routing="direct_response",
+                is_contextual_follow_up=False,
+                resolved_query=user_query,
+                updated_summary="System capabilities or out-of-scope query",
+                confidence=0.8
             )
         
-        if any(pattern in query_lower for pattern in out_of_scope_patterns):
-            return RouterDecision(
-                action="direct_response", 
-                response="I'm a news intelligence reporter focused on current events. I can't help with that, but I'd be happy to discuss recent news!",
-                reasoning="Out-of-scope query (fallback)",
-                routing_confidence=0.9
-            )
+        # Basic pronoun detection
+        has_pronouns = any(word in query_lower for word in [
+            'he', 'him', 'his', 'she', 'her', 'it', 'they', 'them', 'this', 'that'
+        ])
         
-        # Intelligent source selection for fallback
-        suggested_sources = self._get_fallback_sources(query)
+        # Simple context resolution
+        resolved = user_query
+        if has_pronouns and context_summary:
+            # Extract entities from context summary
+            entities = self._extract_entities_from_summary(context_summary)
+            if entities:
+                # Simple replacement (not sophisticated but safe)
+                for pronoun in ['this', 'that', 'it']:
+                    if pronoun in query_lower:
+                        resolved = f"{entities[0]} {user_query.replace(pronoun, '').strip()}"
+                        break
         
-        # Default to graph with extracted context
-        return RouterDecision(
-            action="delegate_to_graph",
-            graph_query=query,
-            reasoning=f"Fallback routing. Error: {error}",
-            resolved_entities=entities if entities else None,
-            resolved_topic=topic,
-            routing_confidence=0.6,
-            suggested_sources=suggested_sources
+        return RoutingLogic(
+            routing="delegate_to_graph",
+            is_contextual_follow_up=has_pronouns,
+            resolved_query=resolved,
+            updated_summary=context_summary or f"Discussing {user_query[:50]}",
+            confidence=0.6  # Low confidence triggers fallback in orchestrator
         )
     
-    def _get_fallback_sources(self, query: str) -> List[str]:
-        """Intelligent source selection for fallback scenarios."""
-        query_lower = query.lower()
-        
-        # Breaking/real-time news patterns
-        if any(word in query_lower for word in ['breaking', 'latest', 'today', 'recent', 'update']):
-            return ['gnews', 'newsdata']
-        
-        # Business/tech patterns
-        if any(word in query_lower for word in ['earnings', 'stock', 'market', 'business', 'company']):
-            return ['newsdata']
-        
-        # International/global patterns
-        if any(word in query_lower for word in ['global', 'international', 'worldwide', 'conflict', 'war']):
-            return ['gnews']
-        
-        # US politics patterns
-        if any(word in query_lower for word in ['trump', 'biden', 'election', 'politics', 'government']):
-            return ['newsapi']
-        
-        # Tech companies
-        if any(word in query_lower for word in ['apple', 'google', 'microsoft', 'tesla', 'amazon', 'meta']):
-            return ['newsdata']
-        
-        # Default: prioritize sources without free tier delays
-        return ['gnews', 'newsdata']
-    
-    def _extract_basic_entities(self, query: str) -> List[str]:
-        """Basic entity extraction for fallback."""
+    def _extract_entities_from_summary(self, summary: str) -> List[str]:
+        """Extract entities from context summary for fallback."""
         entities = []
-        query_lower = query.lower()
+        summary_lower = summary.lower()
         
         # Common entities
-        entity_map = {
-            'apple': 'Apple', 'google': 'Google', 'microsoft': 'Microsoft',
-            'tesla': 'Tesla', 'amazon': 'Amazon', 'meta': 'Meta',
+        entity_patterns = {
             'trump': 'Trump', 'biden': 'Biden', 'putin': 'Putin',
             'israel': 'Israel', 'iran': 'Iran', 'ukraine': 'Ukraine',
-            'russia': 'Russia', 'china': 'China', 'india': 'India'
+            'russia': 'Russia', 'china': 'China', 'india': 'India',
+            'apple': 'Apple', 'google': 'Google', 'tesla': 'Tesla'
         }
         
-        for key, entity in entity_map.items():
-            if key in query_lower:
+        for pattern, entity in entity_patterns.items():
+            if pattern in summary_lower:
                 entities.append(entity)
         
-        return entities[:3]  # Limit to 3 entities
+        return entities[:2]  # Limit to avoid confusion
     
-    def _extract_basic_topic(self, query: str) -> Optional[str]:
-        """Basic topic extraction for fallback."""
-        query_lower = query.lower()
+    def route_query(self, user_query: str, conversation_memory: dict = None) -> RouterDecision:
+        """Legacy compatibility method."""
+        # Extract context summary from memory
+        context_summary = ""
+        if conversation_memory:
+            context_summary = conversation_memory.get('context_summary', '')
+            if not context_summary and conversation_memory.get('last_entities'):
+                # Fallback: create summary from entities
+                entities = conversation_memory['last_entities'][:2]
+                context_summary = f"Discussing {' and '.join(entities)}"
         
-        topic_map = {
-            'war': 'War', 'conflict': 'Conflict', 'election': 'Election',
-            'economy': 'Economy', 'market': 'Market', 'stock': 'Stock',
-            'ai': 'AI', 'technology': 'Technology', 'climate': 'Climate'
-        }
+        # Use synchronous version for compatibility
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            result = loop.run_until_complete(
+                self.resolve_intent_and_context(user_query, context_summary)
+            )
+        except:
+            result = self._fallback_resolution(user_query, context_summary)
         
-        for key, topic in topic_map.items():
-            if key in query_lower:
-                return topic
-        
-        return None
-    
-    def _format_memory(self, memory: dict) -> str:
-        """Format conversation memory for prompt context."""
-        if not memory:
-            return "Memory: No previous conversation context."
-        
-        parts = []
-        if memory.get("last_entities"):
-            parts.append(f"Previous entities: {', '.join(memory['last_entities'])}")
-        if memory.get("last_topic"):
-            parts.append(f"Last topic: {memory['last_topic']}")
-        if memory.get("conversation_context"):
-            parts.append(f"Context: {memory['conversation_context']}")
-            
-        return f"Memory: {' | '.join(parts)}" if parts else "Memory: No context available."
+        # Convert to legacy format
+        return RouterDecision(
+            action=result.routing,
+            graph_query=result.resolved_query,
+            reasoning=f"Single-pass resolution (confidence: {result.confidence:.2f})",
+            routing_confidence=result.confidence
+        )
     
     def get_system_capabilities(self) -> str:
         """Standard capability response for direct handling."""
@@ -234,124 +275,3 @@ class IntelligentRouter:
 • Personal questions unrelated to news
 
 Try asking about any current event or news topic!"""
-    def _extract_conversation_history(self, memory: dict) -> List[str]:
-        """Extract conversation history for entity resolution"""
-        history = []
-        if memory.get('last_query'):
-            history.append(memory['last_query'])
-        if memory.get('conversation_history'):
-            for turn in memory['conversation_history'][-3:]:  # Last 3 turns
-                if isinstance(turn, dict) and 'query' in turn:
-                    history.append(turn['query'])
-                elif isinstance(turn, str):
-                    history.append(turn)
-        return history
-    
-    def _should_handle_directly(self, query: str) -> bool:
-        """Determine if query should be handled directly"""
-        query_lower = query.lower().strip()
-        
-        # System capability patterns  
-        capability_patterns = [
-            'what can you do', 'what are you', 'your purpose', 'capabilities',
-            'help me', 'how do you work'
-        ]
-        
-        # Out-of-scope patterns
-        out_of_scope_patterns = [
-            'recipe', 'cook', 'bake', 'math', 'calculate', 'poem', 'story',
-            'personal advice', 'relationship', 'how to', 'tutorial', 'weather'
-        ]
-        
-        return (any(pattern in query_lower for pattern in capability_patterns) or
-                any(pattern in query_lower for pattern in out_of_scope_patterns))
-    
-    def _create_direct_response(self, query: str) -> RouterDecision:
-        """Create direct response for system queries"""
-        query_lower = query.lower()
-        
-        if any(pattern in query_lower for pattern in ['what can you do', 'capabilities', 'help']):
-            return RouterDecision(
-                action="direct_response",
-                response=None,  # Will use get_system_capabilities()
-                reasoning="System capability inquiry",
-                routing_confidence=0.95
-            )
-        else:
-            return RouterDecision(
-                action="direct_response",
-                response="I'm a news intelligence assistant focused on current events. I can't help with that, but I'd be happy to discuss recent news!",
-                reasoning="Out-of-scope query",
-                routing_confidence=0.9
-            )
-    
-    def _build_contextual_query(self, original_query: str, entity_resolution, context_switch_result, relevant_context) -> str:
-        """Build enhanced query with neural context"""
-        # If no context switch and we have relevant context, enhance the query
-        if not context_switch_result.switch_detected and relevant_context.get('relevant_entities'):
-            # Add relevant entities from context
-            context_entities = relevant_context['relevant_entities']
-            current_entities = [entity.text for entity in entity_resolution.entities]
-            
-            # Find entities from context not in current query
-            additional_entities = [e for e in context_entities if e not in current_entities]
-            
-            if additional_entities:
-                # Enhance query with context
-                enhanced_query = f"{original_query} (context: {', '.join(additional_entities[:2])})"
-                return enhanced_query
-        
-        # Apply coreference resolution
-        enhanced_query = original_query
-        for pronoun, entity in entity_resolution.coreferences.items():
-            enhanced_query = enhanced_query.replace(pronoun, entity)
-        
-        return enhanced_query
-    
-    def _infer_topic_from_entities(self, entities) -> Optional[str]:
-        """Infer topic from resolved entities"""
-        if not entities:
-            return None
-        
-        # Get entity context
-        entity_context = self.entity_resolver.get_entity_context([entity.text for entity in entities])
-        
-        # Infer topic from sectors/regions
-        if entity_context['sectors']:
-            return entity_context['sectors'][0].replace('_', ' ').title()
-        
-        if entity_context['regions']:
-            return f"{entity_context['regions'][0]} Affairs"
-        
-        # Fallback to entity types
-        entity_types = list(entity_context['entity_types'].values())
-        if 'company' in entity_types:
-            return 'Business'
-        elif 'person' in entity_types:
-            return 'Politics'
-        elif 'country' in entity_types:
-            return 'International'
-        
-        return 'General News'
-    
-    def _suggest_sources_neural(self, entities) -> List[str]:
-        """Suggest sources based on entity analysis"""
-        if not entities:
-            return ['gnews', 'newsdata']
-        
-        entity_context = self.entity_resolver.get_entity_context([entity.text for entity in entities])
-        
-        # Business/tech entities -> newsdata
-        if any(sector in ['technology', 'automotive_tech'] for sector in entity_context['sectors']):
-            return ['newsdata', 'gnews']
-        
-        # International entities -> gnews
-        if any(entity_type == 'country' for entity_type in entity_context['entity_types'].values()):
-            return ['gnews', 'newsapi']
-        
-        # Political figures -> newsapi
-        if any(entity_type == 'person' for entity_type in entity_context['entity_types'].values()):
-            return ['newsapi', 'gnews']
-        
-        # Default
-        return ['gnews', 'newsdata']

@@ -181,6 +181,21 @@ def main():
                 with st.expander("🔍 System Decision (Demo Info)", expanded=False):
                     st.write(f"**Routing Decision:** {result['routing_decision']}")
                     st.write(f"**Reasoning:** {result['reasoning']}")
+                    
+                    # Show query transformation
+                    if result.get('resolved_query') != result.get('original_query'):
+                        st.write("**Query Transformation:**")
+                        st.write(f"• Original: `{result.get('original_query', prompt)}`")
+                        st.write(f"• Resolved: `{result['resolved_query']}`")
+                    
+                    # Show context summary
+                    if result.get('context_summary'):
+                        st.write(f"**Context Summary:** {result['context_summary']}")
+                    
+                    # Show fallback status
+                    if result.get('fallback_used'):
+                        st.warning("⚠️ Fallback safety activated (low confidence)")
+                    
                     if result['routing_decision'] == 'direct_response':
                         st.success("✅ Handled directly by LLM router")
                     else:

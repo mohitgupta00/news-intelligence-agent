@@ -271,7 +271,7 @@ Rewritten query:"""
     return query
 
 def query_resolver(state):
-    """Resolve query with router hints optimization."""
+    """Resolve query - skip if already resolved by single-pass router."""
     # Input validation
     if not isinstance(state, dict):
         raise ValueError("State must be a dictionary")
@@ -286,21 +286,41 @@ def query_resolver(state):
     if not query:
         raise ValueError("user_query cannot be empty")
     
+    # Check if already resolved by single-pass router
+    if state.get('resolution_confidence') and state.get('resolution_confidence') >= 0.7:
+        logger.info("Using pre-resolved query from single-pass router")
+        resolved = state.get('resolved_query', query)
+        current_entities = extract_entities_from_text(resolved)
+        
+        return {
+            "resolved_query": resolved,
+            "temporal_constraint": extract_temporal_constraint(query),
+            "extracted_entities": current_entities,
+            "query_resolution": {
+                "original_query": query,
+                "resolved_query": resolved,
+                "resolution_method": "single_pass_router",
+                "entities_used": current_entities,
+                "confidence": state.get('resolution_confidence', 0.8)
+            },
+            "active_entities": current_entities
+        }
+    
+    # Fallback to original resolution logic
     em = state["entity_memory"]
     conversation_history = state.get('conversation_history', [])
     context_hints = state.get('context_hints', {})
     temporal = extract_temporal_constraint(query)
     
-    # OPTIMIZATION: Use router insights if available (eliminates double-think)
+    # Use router insights if available (eliminates double-think)
     if context_hints and context_hints.get('resolved_entities'):
-        # Router already analyzed context - use its insights
-        resolved = query  # Query already processed by router
+        resolved = query
         current_entities = context_hints['resolved_entities']
         resolution_method = "router_hints"
         confidence = context_hints.get('routing_confidence', 0.9)
         entities_used = current_entities
     else:
-        # Fallback to full contextual resolution
+        # Full contextual resolution
         resolution_method = "none"
         entities_used = []
         confidence = 1.0
@@ -316,7 +336,6 @@ def query_resolver(state):
         else:
             resolved = query
         
-        # Extract entities if not from router
         current_entities = extract_entities_from_text(resolved)
     
     # Update entity memory

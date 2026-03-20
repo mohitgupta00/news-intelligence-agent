@@ -57,6 +57,10 @@ class NewsIQState(TypedDict):
     intent: str
     temporal_constraint: Optional[str]
     
+    # Single-pass context resolution
+    context_summary: Optional[str]  # Compact conversation summary
+    resolution_confidence: Optional[float]  # Confidence in query resolution (0-1)
+    
     # Enhanced entity and context tracking
     active_entities: Annotated[List[str], merge_lists]  # Currently discussed entities
     search_queries: Annotated[List[str], merge_lists]   # All search queries used
