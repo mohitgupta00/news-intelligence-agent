@@ -14,14 +14,14 @@ def compare_entities(entity_a: str, entity_b: str, n: int = 5, state: dict = Non
     if cache_key_a in session_cache:
         news_a = session_cache[cache_key_a]
     else:
-        news_a, _ = fetch_news(entity_a, n=n, use_cache=False)
+        news_a, _ = fetch_news(entity_a, n=n)
         if news_a:
             session_cache[cache_key_a] = news_a
     
     if cache_key_b in session_cache:
         news_b = session_cache[cache_key_b]
     else:
-        news_b, _ = fetch_news(entity_b, n=n, use_cache=False)
+        news_b, _ = fetch_news(entity_b, n=n)
         if news_b:
             session_cache[cache_key_b] = news_b
     

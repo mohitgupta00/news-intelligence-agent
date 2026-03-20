@@ -132,7 +132,8 @@ def planner(state):
             "depends_on": []
         }]
     elif intent == "timeline":
-        if any(word in query_lower for word in ['breaking', 'latest', 'today', 'recent']):
+        resolved_lower = resolved.lower()
+        if any(word in resolved_lower for word in ['breaking', 'latest', 'today', 'recent']):
             # For breaking/recent news: prioritize sources without free tier delays
             optimal_sources = ['gnews', 'newsdata']
         else:

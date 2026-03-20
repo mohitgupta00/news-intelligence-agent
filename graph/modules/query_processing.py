@@ -2,11 +2,14 @@
 
 import re
 import time
+import logging
 from typing import Optional
 from groq import Groq
 from langchain_groq import ChatGroq
 from pydantic import BaseModel, Field
 from typing import Literal
+
+logger = logging.getLogger(__name__)
 
 from config import GROQ_API_KEY, GROQ_MODEL
 from utils.query_cache import get_cached_resolution, cache_query_resolution
