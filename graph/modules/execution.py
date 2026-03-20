@@ -2,11 +2,14 @@
 
 import time
 import asyncio
+import logging
 from config import CACHE_TTL_SECONDS
 from tools.fetch_news import fetch_news_with_fallback, _is_likely_hallucinated
 from tools.analyze_text import summarize_articles, analyze_sentiment, extract_entities, analyze_timeline
 from tools.compare_entities import compare_entities
 from utils.search_memory import store_search_result
+
+logger = logging.getLogger(__name__)
 
 async def fetch_news_node(state):
     """Fetch news articles with caching."""
@@ -25,6 +28,14 @@ async def fetch_news_node(state):
     n = step["params"].get("n", 5)
     preferred_sources = step["params"].get("preferred_sources", None)
     session_cache = dict(full_state.get("session_cache", {}))
+    
+    # VALIDATION: Ensure query isn't truncated
+    if len(query) < 5 or query in ['news', 'latest', 'updates', 'recent']:
+        fallback_query = full_state.get("resolved_query", full_state.get("user_query", query))
+        logger.warning(f"Query truncated from '{query}' to fallback: '{fallback_query}'")
+        query = fallback_query
+    
+    logger.info(f"Fetching news for query: '{query}' using sources: {preferred_sources}")
     
     cache_key = f"fetch::{query}::{n}"
     

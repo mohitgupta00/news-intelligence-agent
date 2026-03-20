@@ -161,9 +161,13 @@ def planner(state):
         # Intelligent source routing for each query
         plan = []
         
+        logger.info(f"Planning with api_queries: {api_queries}")
+        
         for i, query in enumerate(api_queries):
             optimal_sources = select_optimal_sources(query, intent, context_hints)
             optimized_query = optimize_query_for_source(query, optimal_sources[0] if optimal_sources else 'newsapi')
+            
+            logger.info(f"Step {i}: Original query '{query}' -> Optimized '{optimized_query}' for sources {optimal_sources}")
             
             plan.append({
                 "step": i,

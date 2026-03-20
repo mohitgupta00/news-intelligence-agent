@@ -293,6 +293,7 @@ def query_resolver(state):
     if state.get('resolution_confidence') and state.get('resolution_confidence') >= 0.7:
         logger.info("Using pre-resolved query from single-pass router")
         resolved = state.get('resolved_query', query)
+        logger.info(f"Pre-resolved query: '{resolved}'")
         current_entities = extract_entities_from_text(resolved)
         
         return {
@@ -365,6 +366,9 @@ def query_resolver(state):
 def query_rewriter(state):
     """Analyze query intent and generate API queries."""
     resolved = state["resolved_query"]
+    
+    logger.info(f"Query rewriter input: '{resolved}'")
+    
     structured = _chat_groq.with_structured_output(QueryAnalysis)
     
     prompt = f"""Analyze user query and determine:
@@ -387,8 +391,10 @@ User query: "{resolved}\""""
     
     try:
         result = structured.invoke(prompt)
+        logger.info(f"Query rewriter output: intent={result.intent}, api_queries={result.api_queries}")
         return {"intent": result.intent, "api_queries": result.api_queries or [resolved]}
-    except Exception:
+    except Exception as e:
+        logger.error(f"Query rewriter failed: {e}")
         return {"intent": "summarize", "api_queries": [resolved]}
 
 def guard_node(state):

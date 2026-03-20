@@ -34,7 +34,7 @@ class NewsIQOrchestrator:
             'user_query': query,
             'thread_id': thread_id,
             'messages': [],
-            'resolved_query': '',
+            'resolved_query': query,  # Use the passed query parameter
             'api_queries': [],
             'intent': '',
             'temporal_constraint': None,
